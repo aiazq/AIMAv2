@@ -83,7 +83,7 @@ def analyze_meeting_audio(audio_file_bytes: bytes, mime_type: str, api_key: str)
         """
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
