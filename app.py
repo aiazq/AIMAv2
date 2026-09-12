@@ -198,41 +198,25 @@ class MeetingMinutesReport(BaseModel):
     transcript: list[TranscriptEntry] = Field(description="Bilingual speaker-diarized transcript.")
 
 
-# AI Universal Template Schemas
-class UniversalParagraphPlan(BaseModel):
-    element_id: str = Field(description="Paragraph id, e.g., 'p_3'.")
-    action: str = Field(
-        description="'KEEP_STATIC' (section headers, logos, labels), 'REPLACE' (substitute sample value with tag), or 'PURGE' (delete dummy content)."
-    )
-    replacement_jinja_tag: str = Field(
+# AI Semantic Transformation Schemas
+class ParagraphRule(BaseModel):
+    p_id: str = Field(description="Paragraph ID (e.g. 'p_0').")
+    action: str = Field(description="'KEEP_STATIC', 'REPLACE_TEMPLATE', or 'PURGE'.")
+    cleaned_template_text: str = Field(
         default="",
-        description="Exact Jinja placeholder if action is REPLACE, preserving static prefixes (e.g., 'Date: {{ date }}' or '{{ executive_summary }}').",
+        description="Clean paragraph text containing variables only (e.g. 'Meeting Title: {{ title }} Date: {{ date }}'). Absolutely NO '{% for' or '{% endfor' tags.",
     )
 
 
-class UniversalTablePlan(BaseModel):
-    table_id: str = Field(description="Coordinate id of table, e.g., 't_0'.")
-    table_purpose: str = Field(
-        default="",
-        description="Semantic purpose identified, e.g., 'attendees_roster', 'action_items', 'metadata_kv', 'agenda_grid'.",
-    )
-    action: str = Field(
-        description="'TRANSFORM_LOOP' to turn into repeating rows, 'KEEP_STATIC' for static layout/signatures, or 'PURGE' to delete."
-    )
-    header_rows_count: int = Field(default=1, description="Number of header rows to preserve untouched at top.")
-    loop_target_entity: str = Field(
-        default="",
-        description="Collection to iterate over: 'attendees', 'action_items', 'agenda_and_decisions', or 'transcript'.",
-    )
-    cell_jinja_expressions: list[str] = Field(
-        default_factory=list,
-        description="Clean variable expressions for each column without loop wrapper syntax. E.g. ['{{ loop.index }}', '{{ a.name }}', '{{ a.designation }}'].",
-    )
+class TableRule(BaseModel):
+    t_id: str = Field(description="Table ID (e.g. 't_0').")
+    table_type: str = Field(description="'ATTENDEES_TABLE', 'ACTION_ITEMS_TABLE', 'STATIC_TABLE', or 'PURGE'.")
+    header_rows_count: int = Field(default=1, description="Number of header rows to keep.")
 
 
-class UniversalTemplatePlan(BaseModel):
-    paragraphs: list[UniversalParagraphPlan] = Field(default_factory=list)
-    tables: list[UniversalTablePlan] = Field(default_factory=list)
+class DocumentAnalysisPlan(BaseModel):
+    paragraphs: list[ParagraphRule] = Field(default_factory=list)
+    tables: list[TableRule] = Field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -337,7 +321,7 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
 
 
 # -----------------------------------------------------------------------------
-# Universal Semantic Template Generation Pipeline
+# Fail-Safe Template Generation Engine
 # -----------------------------------------------------------------------------
 def build_document_skeleton(doc: Document) -> dict:
     paragraphs_meta = []
@@ -349,7 +333,6 @@ def build_document_skeleton(doc: Document) -> dict:
             "id": f"p_{idx}",
             "text": full_text,
             "style": p.style.name if p.style else "Normal",
-            "is_bold": any(r.bold for r in p.runs if r.text.strip()),
         })
 
     tables_meta = []
@@ -362,22 +345,37 @@ def build_document_skeleton(doc: Document) -> dict:
             "id": f"t_{t_idx}",
             "cols_count": len(table.columns),
             "total_rows": len(table.rows),
-            "rows_preview": rows_sample,
+            "headers": rows_sample[0] if rows_sample else [],
+            "preview_rows": rows_sample[1:],
         })
 
     return {"paragraphs": paragraphs_meta, "tables": tables_meta}
 
 
-def set_cell_clean_text(cell, text: str):
-    """Wipes all default runs/paragraphs inside a cell to prevent XML run-splitting."""
+def set_cell_clean(cell, text: str):
+    """Replaces cell contents with a single run without split XML tags."""
     p = cell.paragraphs[0]
     p.text = ""
     for extra_p in cell.paragraphs[1:]:
         p_elem = extra_p._p
         if p_elem.getparent() is not None:
             p_elem.getparent().remove(p_elem)
-    run = p.add_run(text)
-    return run
+    p.add_run(text)
+
+
+def purge_rogue_jinja_tags(doc: Document):
+    """Scours all paragraphs and strips any stray block loop tags that break docxtpl."""
+    for p in doc.paragraphs:
+        full = "".join(r.text for r in p.runs)
+        # If there's an unclosed or orphaned endfor/for in paragraphs, strip it
+        if "{% for" in full or "{% endfor" in full or "{%tr" in full:
+            cleaned = re.sub(r"\{%(?:tr)?\s*(?:for.*?|endfor)\s*%\}", "", full).strip()
+            for r in p.runs:
+                r.text = ""
+            if p.runs:
+                p.runs[0].text = cleaned
+            else:
+                p.add_run(cleaned)
 
 
 def generate_template_from_sample_ai(
@@ -390,133 +388,149 @@ def generate_template_from_sample_ai(
     doc = Document(io.BytesIO(sample_bytes))
 
     if status_container:
-        status_container.info("Step 1/3: Extracting structural document coordinate skeleton...")
+        status_container.info("Step 1/3: Parsing document skeleton...")
     skeleton = build_document_skeleton(doc)
 
     prompt = f"""
-You are an expert Word OpenXML and docxtpl template architect.
-Transform the following real-world meeting document skeleton into a clean, reusable Jinja2 template.
+You are an expert Word document template engineer.
+Analyze this document skeleton and generate a clean plan to replace sample meeting details with Jinja variables.
 
 DOCUMENT SKELETON:
 {json.dumps(skeleton, indent=2)}
 
-AVAILABLE DATA CONTEXT FOR RENDERING:
+AVAILABLE VARIABLES:
 - title: str
 - date: str
 - meeting_time: str
 - minute_taker: str
 - attendees: list[{{name: str, designation: str}}]
-- executive_summary: str
-- agenda_and_decisions: list[{{topic: str, discussion_summary: str, decisions_made: list[str]}}]
-- action_items: list[{{task: str, owner: str, department: str, deadline: str, priority: str, remarks: str}}]
+- action_items: list[{{task: str, owner: str, department: str, deadline: str, remarks: str}}]
 - next_meeting_date: str
 - next_meeting_time: str
 - next_meeting_agenda_focus: str
 - closing_remarks: str
-- transcript: list[{{speaker: str, timestamp: str, translated_text: str}}]
 
 STRICT RULES:
-1. Tables:
-   - For recurring rows, output ONLY the plain column Jinja expressions in cell_jinja_expressions WITHOUT wrapping loop syntax.
-     Example for Attendees (3 columns): ['{{{{ loop.index }}}}', '{{{{ a.name }}}}', '{{{{ a.designation }}}}']
-     Example for Action Items (6 columns): ['{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.remarks }}}}']
-     DO NOT write '{{%tr' or '{{% endfor' in cell_jinja_expressions; Python will handle tag encapsulation.
-   - For metadata or signature tables: action = 'KEEP_STATIC'.
-2. Paragraphs:
-   - Section headers (e.g. 'ATTENDEES', 'Agenda Points:', '3. NEXT MEETING', '4. CLOSING'): action = 'KEEP_STATIC'.
-   - Static labels with values to replace: action = 'REPLACE'. Preserve label prefixes:
-     'Meeting Title: {{{{ title }}}}', 'Date: {{{{ date }}}}', 'Time: {{{{ meeting_time }}}}', 'Minute Taker: {{{{ minute_taker }}}}'.
-   - NEVER write loop tags ('{{% for', '{{% endfor') inside paragraph replacements.
-   - Dummy narrative paragraphs (old summaries, past tasks): action = 'PURGE'.
+1. PARAGRAPHS:
+   - If a paragraph has static headers (e.g. 'ATTENDEES', 'Agenda Points:', '3. NEXT MEETING', '4. CLOSING'): action = 'KEEP_STATIC'.
+   - If it has mixed labels and sample values (e.g. 'Meeting Title: Internal meeting... Date: September 11...'):
+     action = 'REPLACE_TEMPLATE'
+     cleaned_template_text = 'Meeting Title: {{{{ title }}}} Date: {{{{ date }}}} Time: {{{{ meeting_time }}}} Minute Taker: {{{{ minute_taker }}}}'
+   - For '3. NEXT MEETING': replace values with 'Date: {{{{ next_meeting_date }}}} Time: {{{{ next_meeting_time }}}} Agenda Focus: {{{{ next_meeting_agenda_focus }}}}'.
+   - For '4. CLOSING': replace with '4. CLOSING {{{{ closing_remarks }}}}'.
+   - Dummy paragraphs that are purely old sample discussions: action = 'PURGE'.
+   - NEVER write '{{% for' or '{{% endfor' inside paragraphs.
 
-Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
-{json.dumps(UniversalTemplatePlan.model_json_schema())}
+2. TABLES:
+   - Identify table_type:
+     * 'ATTENDEES_TABLE' if it lists participants (Name, Designation).
+     * 'ACTION_ITEMS_TABLE' if it lists agenda points/tasks (Agenda Items, AP, Dead line, Remarks).
+     * 'STATIC_TABLE' otherwise.
+   - header_rows_count: usually 1.
+
+Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
+{json.dumps(DocumentAnalysisPlan.model_json_schema())}
 """
 
     if status_container:
-        status_container.info("Step 2/3: AI synthesizing universal layout mapping...")
+        status_container.info("Step 2/3: Semantic classification via AI...")
 
     raw_plan_json = call_llm_json(base_url, api_key, model_name, prompt)
     plan_dict = json.loads(raw_plan_json)
 
-    for wrapper in ["template_plan", "universal_template_plan", "plan", "data", "result"]:
+    for wrapper in ["plan", "document_analysis_plan", "data", "result"]:
         if wrapper in plan_dict and isinstance(plan_dict[wrapper], dict):
             plan_dict = plan_dict[wrapper]
             break
 
-    plan = UniversalTemplatePlan(**plan_dict)
+    plan = DocumentAnalysisPlan(**plan_dict)
 
     if status_container:
-        status_container.info("Step 3/3: Deterministically executing XML node mutations...")
+        status_container.info("Step 3/3: Deterministically assembling template rows...")
 
-    p_instructions = {item.element_id: item for item in plan.paragraphs}
-    t_instructions = {item.table_id: item for item in plan.tables}
+    p_map = {p.p_id: p for p in plan.paragraphs}
+    t_map = {t.t_id: t for t in plan.tables}
 
-    # 1. Execute Paragraph Mutations
+    # 1. Mutate Paragraphs
     paragraphs_to_remove = []
     for idx, p in enumerate(doc.paragraphs):
-        p_id = f"p_{idx}"
-        if p_id in p_instructions:
-            instr = p_instructions[p_id]
-            if instr.action == "PURGE":
+        pid = f"p_{idx}"
+        if pid in p_map:
+            rule = p_map[pid]
+            if rule.action == "PURGE":
                 paragraphs_to_remove.append(p)
-            elif instr.action == "REPLACE" and instr.replacement_jinja_tag:
-                cleaned_tag = instr.replacement_jinja_tag.replace("{% endfor %}", "").replace("{%tr endfor %}", "")
+            elif rule.action == "REPLACE_TEMPLATE" and rule.cleaned_template_text:
+                # Clear runs and insert clean template text
                 if p.runs:
-                    p.runs[0].text = cleaned_tag
+                    p.runs[0].text = rule.cleaned_template_text
                     for r in p.runs[1:]:
                         r.text = ""
                 else:
-                    p.add_run(cleaned_tag)
+                    p.add_run(rule.cleaned_template_text)
 
     for p in paragraphs_to_remove:
-        p_element = p._p
-        if p_element.getparent() is not None:
-            p_element.getparent().remove(p_element)
+        p_elem = p._p
+        if p_elem.getparent() is not None:
+            p_elem.getparent().remove(p_elem)
 
-    # 2. Execute Table Mutations (Clean DocxTpl Row Loop Generation)
+    # 2. Mutate Tables (Controlled & deterministic row-loop generation)
     for t_idx, table in enumerate(doc.tables):
-        t_id = f"t_{t_idx}"
-        if t_id in t_instructions:
-            plan_t = t_instructions[t_id]
-            if plan_t.action == "TRANSFORM_LOOP" and plan_t.cell_jinja_expressions:
-                while len(table.rows) > plan_t.header_rows_count:
-                    row = table.rows[-1]
-                    tr = row._tr
-                    tr.getparent().remove(tr)
+        tid = f"t_{t_idx}"
+        rule = t_map.get(tid)
+        if not rule:
+            continue
 
-                new_row = table.add_row()
-                raw_cols = list(plan_t.cell_jinja_expressions)
+        if rule.table_type in ["ATTENDEES_TABLE", "ACTION_ITEMS_TABLE"]:
+            # Delete sample dummy data rows
+            while len(table.rows) > rule.header_rows_count:
+                row = table.rows[-1]
+                tr = row._tr
+                tr.getparent().remove(tr)
 
-                clean_cols = []
-                for expr in raw_cols:
-                    c = re.sub(r"\{%(?:tr)?\s*(?:for.*?|endfor)\s*%\}", "", expr).strip()
-                    clean_cols.append(c)
+            new_row = table.add_row()
+            cols_count = len(new_row.cells)
 
-                entity = plan_t.loop_target_entity or "action_items"
-                var_name = "a" if "attendee" in entity.lower() else "item"
+            if rule.table_type == "ATTENDEES_TABLE":
+                # Strict, guaranteed docxtpl row loop
+                if cols_count == 3:
+                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ loop.index }}")
+                    set_cell_clean(new_row.cells[1], "{{ a.name }}")
+                    set_cell_clean(new_row.cells[2], "{{ a.designation }}{%tr endfor %}")
+                elif cols_count == 2:
+                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ a.name }}")
+                    set_cell_clean(new_row.cells[1], "{{ a.designation }}{%tr endfor %}")
+                else:
+                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ a.name }}")
+                    set_cell_clean(new_row.cells[-1], "{{ a.designation }}{%tr endfor %}")
 
-                for c_idx, cell in enumerate(new_row.cells):
-                    val = clean_cols[c_idx] if c_idx < len(clean_cols) else ""
-                    if c_idx == 0:
-                        cell_content = f"{{%tr for {var_name} in {entity} %}}{val}"
-                    elif c_idx == len(new_row.cells) - 1:
-                        cell_content = f"{val}{{%tr endfor %}}"
-                    else:
-                        cell_content = val
+            elif rule.table_type == "ACTION_ITEMS_TABLE":
+                # Strict, guaranteed docxtpl row loop matching your sample's 6 columns
+                if cols_count >= 6:
+                    set_cell_clean(new_row.cells[0], "{%tr for item in action_items %}{{ loop.index }}")
+                    set_cell_clean(new_row.cells[1], "{{ item.task }}")
+                    set_cell_clean(new_row.cells[2], "{{ item.owner }}")
+                    set_cell_clean(new_row.cells[3], "{{ item.department }}")
+                    set_cell_clean(new_row.cells[4], "{{ item.deadline }}")
+                    set_cell_clean(new_row.cells[5], "{{ item.remarks }}{%tr endfor %}")
+                elif cols_count >= 4:
+                    set_cell_clean(new_row.cells[0], "{%tr for item in action_items %}{{ item.task }}")
+                    set_cell_clean(new_row.cells[1], "{{ item.owner }}")
+                    set_cell_clean(new_row.cells[2], "{{ item.deadline }}")
+                    set_cell_clean(new_row.cells[-1], "{{ item.remarks }}{%tr endfor %}")
 
-                    set_cell_clean_text(cell, cell_content)
+        elif rule.table_type == "PURGE":
+            tbl = table._tbl
+            if tbl.getparent() is not None:
+                tbl.getparent().remove(tbl)
 
-            elif plan_t.action == "PURGE":
-                tbl = table._tbl
-                if tbl.getparent() is not None:
-                    tbl.getparent().remove(tbl)
+    # 3. Purge any stray rogue jinja tags from paragraphs
+    purge_rogue_jinja_tags(doc)
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
     template_bytes = out_stream.getvalue()
 
-    # Dry-Run Self Healing
+    # Self-Testing Compilation: verifies template before handing to user
     try:
         test_tpl = DocxTemplate(io.BytesIO(template_bytes))
         test_ctx = {
@@ -525,14 +539,19 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
             "meeting_time": "",
             "minute_taker": "",
             "attendees": [{"name": "Test User", "designation": "CEO"}],
-            "action_items": [{"task": "Task", "owner": "Owner", "department": "", "deadline": "TBD", "remarks": ""}],
-            "agenda_and_decisions": [],
-            "transcript": [],
+            "action_items": [{"task": "Task", "owner": "Owner", "department": "Admin", "deadline": "TBD", "remarks": ""}],
+            "next_meeting_date": "TBD",
+            "next_meeting_time": "TBD",
+            "next_meeting_agenda_focus": "",
+            "closing_remarks": "",
         }
         test_tpl.render(test_ctx)
+        if status_container:
+            status_container.success("Template verified and compiled successfully!")
     except Exception as validation_err:
         if status_container:
-            status_container.warning(f"Dry-run noticed syntax adjustment: {validation_err}")
+            status_container.error(f"Template compilation failed during self-test: {validation_err}")
+        raise validation_err
 
     return io.BytesIO(template_bytes)
 
@@ -549,7 +568,7 @@ def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> i
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
 
-    # Normalization ensuring compatibility with both object models and string templates
+    # Attendees Normalization
     normalized_attendees = []
     for a in context.get("attendees", []):
         if isinstance(a, dict):
@@ -558,7 +577,7 @@ def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> i
             normalized_attendees.append(_AttendeeView({"name": str(a), "designation": ""}))
     context["attendees"] = normalized_attendees
 
-    # Action Items Aliasing (remarks <-> priority)
+    # Action Items Normalization (alias remarks and priority)
     for item in context.get("action_items", []):
         if "remarks" not in item or not item["remarks"]:
             item["remarks"] = item.get("priority", "")
@@ -1002,7 +1021,6 @@ def main():
                             converted_bytes = converted_io.getvalue()
                             st.session_state["active_template_bytes"] = converted_bytes
                             st.session_state["converted_template_download"] = converted_bytes
-                            tpl_status.success("Universal template generated! All dummy rows & past text excised.")
                         except Exception as err:
                             tpl_status.error(f"AI conversion error: {err}")
 
