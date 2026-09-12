@@ -67,7 +67,7 @@ def build(path):
     p.add_run().add_break()
     p.add_run("Time: 10:00 AM")
     p.add_run().add_break()
-    p.add_run("Minute Taker: A. Khan")
+    p.add_run("Minute Taker: P. Sample")
 
     doc.add_paragraph("ATTENDEES")
     _table(doc, ["Sr.#", "Name", "Designation"],

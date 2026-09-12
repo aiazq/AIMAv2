@@ -219,7 +219,7 @@ def test_real_sample_converts_without_crashing():
 # D11 — special characters must survive rendering
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("value", [
-    "Sarhad Chamber & ISO 14001 Registration",
+    "Org & Partner Ltd Registration",
     "A & B",
     "less < than and greater > than",
     'quotes "double" and \'single\'',
@@ -237,14 +237,14 @@ def test_special_characters_survive_render(value):
 
 
 def test_ampersand_from_real_sample_content_survives():
-    """D11 on actual client content: the ISO 14001 row."""
+    """D11 on real-world content: an organisation name with an embedded '&'."""
     tpl = Document()
     tpl.add_paragraph("{{ item.task }}")
     buf = io.BytesIO()
     tpl.save(buf)
     out = render(buf.getvalue(), {
-        "item": {"task": "Sarhad Chamber & ISO 14001 Registration"}})
-    assert "Chamber & ISO" in all_text(Document(io.BytesIO(out)))
+        "item": {"task": "Org & Partner Ltd Registration"}})
+    assert "Org & Partner" in all_text(Document(io.BytesIO(out)))
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +474,11 @@ def test_model_purge_on_placeholder_is_recovered():
 
     ctx = _ctx_for_render()
     ctx["action_items"] = [
-        {"task": "Chairs repaired", "owner": "Nayab",
+        {"task": "Chairs repaired", "owner": "Person A",
          "department": "Admin", "deadline": "13 Sep", "remarks": ""},
     ]
     out = all_text(Document(io.BytesIO(render(tpl, ctx))))
-    assert "1. Chairs repaired — Nayab" in out, out
+    assert "1. Chairs repaired — Person A" in out, out
 
 
 def test_model_keep_static_on_placeholder_is_recovered():
@@ -506,11 +506,11 @@ def test_model_keep_static_on_placeholder_is_recovered():
 
     ctx = _ctx_for_render()
     ctx["action_items"] = [
-        {"task": "Chairs repaired", "owner": "Nayab",
+        {"task": "Chairs repaired", "owner": "Person A",
          "department": "Admin", "deadline": "13 Sep", "remarks": ""},
     ]
     out = all_text(Document(io.BytesIO(render(tpl, ctx))))
-    assert "1. Chairs repaired — Nayab" in out, out
+    assert "1. Chairs repaired — Person A" in out, out
     assert "<Action Items Table goes here>" not in out, out
 
 
@@ -672,14 +672,14 @@ def test_real_sample_end_to_end_roundtrip():
         "title": "Q4 Policy Review & Planning",
         "date": "12/09/2026",
         "meeting_time": "10:00AM - 12:50PM",
-        "minute_taker": "Ali & Nayab",
-        "attendees": [{"name": "Saadat Khattak", "designation": "CEO"},
-                      {"name": "Wasim Kakakhel", "designation": "Director"}],
+        "minute_taker": "Person A & Person B",
+        "attendees": [{"name": "Person C", "designation": "CEO"},
+                      {"name": "Person D", "designation": "Director"}],
         "action_items": [
-            {"task": "Sarhad Chamber & ISO 14001 Registration",
-             "owner": "Nayab", "department": "Admin",
+            {"task": "Org & Partner Ltd Registration",
+             "owner": "Person A", "department": "Admin",
              "deadline": "13 Sep", "remarks": "urgent"},
-            {"task": "Acquire proposals", "owner": "Saadat sb",
+            {"task": "Acquire proposals", "owner": "Person C",
              "department": "BD", "deadline": "TBD", "remarks": ""},
         ],
         "next_meeting_date": "18/09/2026",
@@ -691,9 +691,9 @@ def test_real_sample_end_to_end_roundtrip():
     text = all_text(Document(io.BytesIO(out)))
 
     assert "Q4 Policy Review & Planning" in text
-    assert "Sarhad Chamber & ISO 14001 Registration" in text, "& lost in real round-trip"
-    assert "Saadat Khattak" in text
-    assert "Wasim Kakakhel" in text
+    assert "Org & Partner Ltd Registration" in text, "& lost in real round-trip"
+    assert "Person C" in text
+    assert "Person D" in text
     assert media_parts(out) == media_parts(load_real())
 
 
@@ -752,14 +752,14 @@ def test_placeholder_paragraph_becomes_collection_loop():
     # and it must actually render one line per item
     ctx = _ctx_for_render()
     ctx["action_items"] = [
-        {"task": "Chairs repaired", "owner": "Nayab",
+        {"task": "Chairs repaired", "owner": "Person A",
          "department": "Admin", "deadline": "13 Sep", "remarks": ""},
-        {"task": "Quotations", "owner": "Faisal",
+        {"task": "Quotations", "owner": "Person B",
          "department": "Admin", "deadline": "TBD", "remarks": ""},
     ]
     out = all_text(Document(io.BytesIO(render(tpl, ctx))))
-    assert "1. Chairs repaired — Nayab (Admin, due 13 Sep)" in out, out
-    assert "2. Quotations — Faisal (Admin, due TBD)" in out, out
+    assert "1. Chairs repaired — Person A (Admin, due 13 Sep)" in out, out
+    assert "2. Quotations — Person B (Admin, due TBD)" in out, out
     # The placeholder text must NOT survive anywhere.
     assert "<Action Items Table goes here>" not in out, (
         f"placeholder text leaked into output: {out!r}")
@@ -786,11 +786,11 @@ def test_transcript_placeholder_becomes_loop():
 
     ctx = _ctx_for_render()
     ctx["transcript"] = [
-        {"speaker": "Saadat", "timestamp": "00:12",
-         "original_text": "Bismillah", "translated_text": "In the name of God"},
+        {"speaker": "Person C", "timestamp": "00:12",
+         "original_text": "Opening remarks", "translated_text": "Opening remarks"},
     ]
     out = all_text(Document(io.BytesIO(render(tpl, ctx))))
-    assert "[00:12] Saadat: Bismillah (In the name of God)" in out, out
+    assert "[00:12] Person C: Opening remarks (Opening remarks)" in out, out
     assert "The complete transcript with translation text goes here" not in out, (
         f"placeholder text leaked into output: {out!r}")
 

@@ -20,5 +20,5 @@ Powered by **Streamlit** and **Gemini 3.6 Flash**.
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/](https://github.com/)mahmudaq/AIMA.git
+git clone https://github.com/mahmudaq/AIMA.git
 cd AIMA
