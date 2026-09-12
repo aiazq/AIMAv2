@@ -12,6 +12,7 @@ import httpx
 import streamlit as st
 from docx import Document
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field, field_validator
 
@@ -218,13 +219,57 @@ class MeetingMinutesReport(BaseModel):
 
 
 # AI Semantic Transformation Schemas
+#
+# A SECTION of the document may hold a LIST rather than a single value: the
+# client writes a placeholder paragraph ("<Action Items Table goes here>", "The
+# complete transcript ... goes here") and expects that section to be filled with
+# every item. ParagraphRule therefore carries an optional `collection`: when set,
+# the assembler expands the paragraph into a `{%p for ... %}` loop.
+#
+# Without this, such a paragraph is indistinguishable from leftover dummy text
+# and gets PURGEd — the heading survives and the whole section silently vanishes.
 class ParagraphRule(BaseModel):
     p_id: str = Field(description="Paragraph ID (e.g. 'p_0').")
-    action: str = Field(description="'KEEP_STATIC', 'REPLACE_TEMPLATE', or 'PURGE'.")
+    action: str = Field(
+        description=("'KEEP_STATIC', 'REPLACE_TEMPLATE', or 'PURGE'. "
+                     "Use 'REPLACE_TEMPLATE' + collection for a placeholder that "
+                     "should become a repeating list."),
+    )
     cleaned_template_text: str = Field(
         default="",
-        description="Clean paragraph text containing variables only (e.g. 'Meeting Title: {{ title }} Date: {{ date }}'). Absolutely NO '{% for' or '{% endfor' tags.",
+        description=(
+            "Template text for this paragraph, using variables only "
+            "(e.g. 'Meeting Title: {{ title }}'). For a repeating section use the "
+            "collection's item variable, e.g. '{{ item.task }} — {{ item.owner }}'. "
+            "Do NOT add any '{%' or '%}' tags; the assembler writes the loop tags."
+        ),
     )
+    collection: str | None = Field(
+        default=None,
+        description=(
+            "Set ONLY when this paragraph is a placeholder for a repeating list, "
+            "e.g. a '<... goes here>' line under an ACTION ITEMS or TRANSCRIPT "
+            "heading, or a 'TODO'/'TBD' row the client expects to be filled. "
+            "Allowed values: 'action_items' (loop variable 'item'), "
+            "'attendees' ('attendee'), 'transcript' ('entry'), "
+            "'agenda_and_decisions' ('agenda'), 'detected_speakers' ('speaker'). "
+            "The text must then reference that loop variable. "
+            "Leave null for ordinary one-off values."
+        ),
+    )
+
+
+# Per-collection loop variable name. The LLM is told these names, but we treat the
+# list itself as authoritative: if the model writes a different variable in the
+# body, the loop variable is renamed to match it (a mismatch renders as empty
+# strings in docxtpl, with no error at all).
+_DOC_COLLECTIONS = {
+    "action_items": "item",
+    "attendees": "attendee",
+    "transcript": "entry",
+    "agenda_and_decisions": "agenda",
+    "detected_speakers": "speaker",
+}
 
 
 class TableRule(BaseModel):
@@ -294,7 +339,16 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     return [DEFAULT_MODEL]
 
 
-def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str) -> str:
+def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str,
+                  max_attempts: int = 4) -> str:
+    """Call an OpenAI-compatible (or Gemini) endpoint and return the raw JSON text.
+
+    Transient failures are retried with exponential backoff. Free-tier Gemini
+    projects answer a burst of calls with 429 RESOURCE_EXHAUSTED and a
+    "reset after 49s" hint; without a retry the whole document conversion dies on
+    a limit that clears itself. Permanent failures (401/403/400/404) are raised
+    immediately — retrying those only wastes the user's time and hides the cause.
+    """
     cleaned_base = endpoint_base.rstrip("/")
     is_gemini = "googleapis.com" in cleaned_base
 
@@ -318,34 +372,67 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
             "temperature": 0.1,
         }
 
-    with httpx.Client(timeout=90.0) as client:
-        res = client.post(url, headers=headers, json=payload)
+    # Status codes worth another go: rate limits and server-side hiccups.
+    RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504}
+    last_error = "no attempt made"
 
-    if res.status_code != 200:
-        raise RuntimeError(f"HTTP {res.status_code} from provider: {res.text}")
+    for attempt in range(max_attempts):
+        if attempt:
+            # 1s, 2s, 4s — enough for a "reset after 2s" burst, and a single retry
+            # after a long Retry-After is handled by the cap below.
+            delay = min(2 ** (attempt - 1), 8)
+            time.sleep(delay)
 
-    if not (res.headers.get("content-type") or "").lower().startswith("application/json"):
-        raise RuntimeError(
-            "Provider returned a non-JSON response "
-            f"(content-type={res.headers.get('content-type')!r}): {res.text[:300]}"
-        )
+        try:
+            with httpx.Client(timeout=90.0) as client:
+                res = client.post(url, headers=headers, json=payload)
+        except httpx.HTTPError as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
 
-    res_json = res.json()
-    if "candidates" in res_json:
-        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-    elif "choices" in res_json:
-        raw_text = res_json["choices"][0]["message"]["content"]
-    else:
-        raw_text = json.dumps(res_json)
+        if res.status_code != 200:
+            last_error = f"HTTP {res.status_code} from provider: {res.text[:400]}"
+            if res.status_code in RETRYABLE:
+                continue
+            raise RuntimeError(last_error)
 
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    return cleaned.strip()
+        if not (res.headers.get("content-type") or "").lower().startswith(
+                "application/json"):
+            # A proxy that ignored stream:false and sent text/event-stream. Often
+            # clears on retry; if it never does, fail with the body for diagnosis.
+            last_error = (
+                "Provider returned a non-JSON response "
+                f"(content-type={res.headers.get('content-type')!r}): "
+                f"{res.text[:300]}"
+            )
+            continue
+
+        res_json = res.json()
+        if "candidates" in res_json:
+            raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        elif "choices" in res_json:
+            raw_text = res_json["choices"][0]["message"]["content"]
+        else:
+            last_error = f"Unexpected response shape: {str(res_json)[:300]}"
+            continue
+
+        # Models often wrap JSON in a markdown fence even when asked not to.
+        cleaned = (raw_text or "").strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        if not cleaned:
+            last_error = "Provider returned an empty completion"
+            continue
+        return cleaned
+
+    raise RuntimeError(
+        f"LLM call failed after {max_attempts} attempt(s). Last error: {last_error}")
 
 
 # -----------------------------------------------------------------------------
@@ -624,6 +711,184 @@ def purge_rogue_jinja_tags(doc: Document):
                     clean_paragraph(p)
 
 
+def _para_full_text(p) -> str:
+    """Text of a paragraph including any rendered soft line breaks.
+
+    `p.text` drops <w:br/> (it only walks <w:t>), so text that wraps with
+    Shift+Enter looks truncated to anything comparing against the skeleton.
+    """
+    return "".join(node.text or "" for node in p._p.iter(qn("w:t"))) or p.text
+
+
+# A paragraph that occupies a whole section but describes no content — it is where
+# the client intends the generated list to be poured in.
+_PLACEHOLDER_RE = re.compile(
+    r"("
+    r"[<\[{]{1,2}\s*(?:insert|add|put|write)?[^>\]}]{0,60}goes?\s+here[^>\]}]{0,20}[>\]}]{1,2}"
+    r"|goes?\s+here"
+    r"|placeholder"
+    r"|lorem\s+ipsum"
+    r"|^t\.?b\.?d\.?$"
+    r"|^t\.?o\.?d\.?o\.?$"
+    r"|\binsert\b[^.]{0,40}\bhere\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Last-resort mapping from a section HEADING to the list that belongs under it, so
+# a heading plus a placeholder resolves even when the heading wording is unusual.
+_HEADING_COLLECTION_HINTS = (
+    ("action item", "action_items"),
+    ("action point", "action_items"),
+    ("transcript", "transcript"),
+    ("diariz", "transcript"),
+    ("attendee", "attendees"),
+    ("participant", "attendees"),
+    ("agenda", "agenda_and_decisions"),
+    ("speaker", "detected_speakers"),
+)
+
+
+def _norm_heading(h: str) -> str:
+    """Normalise a heading for matching: strip trailing punctuation, collapse
+    whitespace, drop a leading numbering like '3.' or '4)'."""
+    h = re.sub(r"\s+", " ", (h or "").strip())
+    h = re.sub(r"^[\d]+[.)]\s*", "", h)
+    return h.strip(" :.-\u2014\t").lower()
+
+
+def _looks_like_placeholder(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 200:
+        return False
+    return bool(_PLACEHOLDER_RE.search(t))
+
+
+def _collection_for_heading(heading: str) -> str | None:
+    h = _norm_heading(heading)
+    for key, collection in _HEADING_COLLECTION_HINTS:
+        if key in h:
+            return collection
+    return None
+
+
+def _placeholder_collections(doc) -> dict:
+    """Map every placeholder paragraph's ID -> the collection its heading implies.
+
+    Each placeholder is paired with the last heading-ish line above it, so a
+    document with several placeholder sections resolves each one independently.
+    Returns {p_id: collection} for placeholders whose heading maps to a known list.
+    """
+    out: dict = {}
+    last_heading: str | None = None
+    p_index = 0
+    for child in doc.element.body.iterchildren():
+        if child.tag != qn("w:p"):
+            continue
+        p = Paragraph(child, doc)
+        pid = f"p_{p_index}"
+        p_index += 1
+        txt = p.text.strip()
+        if not txt:
+            continue
+        if _looks_like_placeholder(txt):
+            collection = (
+                _collection_for_heading(last_heading or "")
+                or _collection_for_heading(txt)
+            )
+            if collection:
+                out[pid] = collection
+            continue
+        # Treat a short, colon-suffixed or ALL-CAPS line as a heading.
+        if len(txt) <= 80 and (
+            txt.endswith(":") or txt.isupper() or len(txt.split()) <= 6
+        ):
+            last_heading = txt
+    return out
+
+
+def _default_body_for(collection: str) -> str:
+    """A sensible one-item line per collection, used when the model gave a
+    placeholder paragraph no usable text of its own."""
+    return {
+        "action_items": (
+            "{{ loop.index }}. {{ item.task }} — {{ item.owner }} "
+            "({{ item.department }}, due {{ item.deadline }}){% if item.remarks %} "
+            "{{ item.remarks }}{% endif %}"
+        ),
+        "transcript": (
+            "[{{ entry.timestamp }}] {{ entry.speaker }}: {{ entry.original_text }} "
+            "({{ entry.translated_text }})"
+        ),
+        "attendees": "{{ attendee.name }} — {{ attendee.designation }}",
+        "agenda_and_decisions": (
+            "{{ agenda.topic }}: {{ agenda.discussion_summary }}"
+        ),
+        "detected_speakers": "{{ speaker.speaker_id }}: {{ speaker.inferred_name }}",
+    }.get(collection, "{{ %s }}" % _DOC_COLLECTIONS.get(collection, "item"))
+
+
+def _clear_runs_keep_format(p):
+    """Drop a paragraph's runs, keeping the paragraph itself and its pPr."""
+    for r in list(p.runs):
+        r._element.getparent().remove(r._element)
+
+
+def expand_paragraph_collection_loop(paragraph, collection: str, body_text: str,
+                                     doc) -> tuple[str, str]:
+    """Turn ONE placeholder paragraph into a docxtpl `{%p for %}` loop.
+
+    docxtpl expands `{%p ... %}` tags that sit ALONE in a paragraph into whole
+    paragraph loops. The opening tag, the body and the closing tag must therefore
+    live in THREE SEPARATE paragraphs: putting them in one paragraph (or putting
+    `for` and `endfor` together) raises
+    `TemplateSyntaxError: Encountered unknown tag 'endfor'` — verified empirically.
+
+    We clone the placeholder paragraph twice so the loop body inherits the
+    client's own formatting, then insert the clone and the closing-tag paragraph
+    directly after the original. Inserts happen after the loop that walks
+    doc.paragraphs, so this does not disturb its indices.
+
+    Returns (loop_variable, body_text).
+    """
+    var = _DOC_COLLECTIONS[collection]
+
+    # Match the variable the body actually uses, so the tag and the body agree.
+    # A mismatch is invisible: docxtpl renders `{{ item.task }}` as '' when the
+    # loop variable is named something else.
+    # `loop` is Jinja's own special variable and must never be used as the target.
+    for cand in re.findall(r"\{\{\s*(\w+)\.", body_text):
+        if cand != "loop":
+            var = cand
+            break
+
+    # Empty the placeholder first, keep its pPr, then use THAT as the mould for the
+    # body and closing-tag paragraphs. If the mould were taken before clearing, the
+    # clones would each still carry the original placeholder text and the emitted
+    # paragraphs would read e.g.
+    #   'The complete transcript goes here{%p endfor %}'
+    # (still compiles, so only an exact-equality assertion catches it).
+    _clear_runs_keep_format(paragraph)
+    base_p = copy.deepcopy(paragraph._p)
+
+    # 1) opening tag, alone in the original paragraph
+    paragraph.add_run(f"{{%p for {var} in {collection} %}}")
+
+    # 2) body paragraph = an empty clone, carrying only the item text
+    body_p = copy.deepcopy(base_p)
+    body_para = Paragraph(body_p, paragraph._parent)
+    body_para.add_run(body_text)
+
+    # 3) closing tag, alone in a second empty clone
+    end_p = copy.deepcopy(base_p)
+    end_para = Paragraph(end_p, paragraph._parent)
+    end_para.add_run("{%p endfor %}")
+
+    paragraph._p.addnext(end_p)
+    paragraph._p.addnext(body_p)
+    return var, body_text
+
+
 def generate_template_from_sample_ai(
     sample_bytes: bytes,
     base_url: str,
@@ -669,7 +934,36 @@ STRICT RULES:
    - For '3. NEXT MEETING': replace values with 'Date: {{{{ next_meeting_date }}}} Time: {{{{ next_meeting_time }}}} Agenda Focus: {{{{ next_meeting_agenda_focus }}}}'.
    - For '4. CLOSING': replace with '4. CLOSING {{{{ closing_remarks }}}}'.
    - Dummy paragraphs that are purely old sample discussions: action = 'PURGE'.
-   - NEVER write '{{% for' or '{{% endfor' inside paragraphs.
+
+   - REPEATING SECTIONS (IMPORTANT): a placeholder paragraph that stands in for a
+     LIST of items must NOT be purged. Look for a heading followed by a
+     placeholder such as '<Action Items Table goes here>', 'The complete
+     transcript ... goes here', '<<insert ...>>', 'TODO', or a single stub line
+     in a section whose content is obviously a list. For these:
+       action = 'REPLACE_TEMPLATE'
+       collection = the matching list
+       cleaned_template_text = ONE line showing how ONE item should be written
+     Allowed collections and the loop variable to use in the text:
+       * 'action_items'          -> item    fields: item.task, item.owner,
+                                              item.department, item.deadline,
+                                              item.remarks
+       * 'transcript'            -> entry   fields: entry.speaker, entry.timestamp,
+                                              entry.original_text,
+                                              entry.translated_text
+       * 'attendees'             -> attendee fields: attendee.name,
+                                              attendee.designation
+       * 'agenda_and_decisions'  -> agenda  fields: agenda.topic,
+                                              agenda.discussion_summary,
+                                              agenda.decisions_made
+       * 'detected_speakers'     -> speaker fields: speaker.speaker_id,
+                                              speaker.inferred_name
+     Example, for '<Action Items Table goes here>' under an ACTION ITEMS heading:
+       action = 'REPLACE_TEMPLATE', collection = 'action_items',
+       cleaned_template_text = '{{{{ loop.index }}}}. {{{{ item.task }}}} — {{{{ item.owner }}}} ({{{{ item.department }}}}, due {{{{ item.deadline }}}})'
+     Leave 'collection' null for every ordinary single-value paragraph.
+     The section HEADING itself (e.g. 'ACTION ITEMS') stays 'KEEP_STATIC'.
+   - NEVER write '{{% for' or '{{% endfor' inside paragraphs; the assembler adds
+     the loop tags itself. Only the single-item text is yours to write.
 
 2. TABLES:
    - Identify table_type:
@@ -708,13 +1002,53 @@ Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
 
     # 1. Mutate Paragraphs
     paragraphs_to_remove = []
+    collection_lists = []
+    conversion_notes = []
+    placeholder_hints = _placeholder_collections(doc)
     for idx, p in enumerate(doc.paragraphs):
         pid = f"p_{idx}"
-        if pid in p_map:
-            rule = p_map[pid]
-            if rule.action == "PURGE":
-                paragraphs_to_remove.append(p)
-            elif rule.action == "REPLACE_TEMPLATE" and rule.cleaned_template_text:
+        if pid not in p_map:
+            continue
+        rule = p_map[pid]
+
+        # --- Deterministic override, applied BEFORE the model's action ---
+        # The model is NOT reliable here: across identical runs it classified the
+        # client's "<Action Items Table goes here>" as KEEP_STATIC, PURGE and
+        # REPLACE_TEMPLATE. PURGE and KEEP_STATIC both lose the section for good
+        # (deleted, or the literal placeholder text ships into every generated
+        # document unfilled), and that IS the reported bug. So when a paragraph is a
+        # section placeholder that resolves to a list we hold, we build the loop
+        # regardless of what the model said. This is the safety net that makes the
+        # feature deterministic.
+        hint = placeholder_hints.get(pid)
+        if hint and rule.action != "REPLACE_TEMPLATE":
+            collection_lists.append(
+                (p, pid, hint, _default_body_for(hint)))
+            conversion_notes.append(
+                f"{pid}: model said {rule.action} but text is a section "
+                f"placeholder; recovered as a '{hint}' loop")
+            continue
+        if hint is None and _looks_like_placeholder(_para_full_text(p)) \
+                and not rule.collection:
+            # Unresolvable placeholder: never print it into client output.
+            paragraphs_to_remove.append(p)
+            conversion_notes.append(f"{pid}: removed unresolvable placeholder")
+            continue
+
+        if rule.action == "PURGE":
+            paragraphs_to_remove.append(p)
+        elif rule.action == "REPLACE_TEMPLATE" and rule.cleaned_template_text:
+            if rule.collection:
+                if rule.collection not in _DOC_COLLECTIONS:
+                    raise ValueError(
+                        f"Paragraph {pid} was assigned unknown collection "
+                        f"{rule.collection!r}; allowed: "
+                        f"{', '.join(sorted(_DOC_COLLECTIONS))}"
+                    )
+                # Placeholder for a repeating section -> paragraph loop.
+                collection_lists.append(
+                    (p, pid, rule.collection, rule.cleaned_template_text))
+            else:
                 # Clear runs and insert clean template text
                 if p.runs:
                     p.runs[0].text = rule.cleaned_template_text
@@ -733,12 +1067,23 @@ Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
     #    strip the `{%tr for %}` / `{%tr endfor %}` tags we are about to create.
     purge_rogue_jinja_tags(doc)
 
+    # 2b. Expand the repeating-section placeholders into `{%p for %}` loops.
+    #     The opening tag, body and closing tag go in three SEPARATE paragraphs —
+    #     docxtpl requires this, exactly as for the table row loops. Expanding here
+    #     (after the Purge above, like the table loops) also means the tags we
+    #     create cannot be stripped by it. Each expansion appends TWO paragraphs,
+    #     so we expand in reverse so an earlier insert cannot shift a later target
+    #     out of position.
+    for p, pid, collection, body_text in reversed(collection_lists):
+        var, _ = expand_paragraph_collection_loop(p, collection, body_text, doc)
+        conversion_notes.append(
+            f"{pid}: {{%p for {var} in {collection} %}} -> {collection}")
+
     # 3. Mutate Tables (deterministic row-loop generation)
     loop_specs = {
         "ATTENDEES_TABLE": ("attendee", "attendees"),
         "ACTION_ITEMS_TABLE": ("item", "action_items"),
     }
-    conversion_notes = []
 
     for t_idx, table in enumerate(doc.tables):
         tid = f"t_{t_idx}"

@@ -12,6 +12,7 @@ Run:  ./.venv/bin/python -m pytest tests/ -q
 """
 import copy
 import io
+import json
 import os
 import re
 import sys
@@ -86,6 +87,29 @@ def all_text(doc):
 def media_parts(docx_bytes):
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
         return [n for n in z.namelist() if n.startswith("word/media/")]
+
+
+def _ctx_for_render():
+    """A complete render context for every variable the app's templates use."""
+    return {
+        "title": "T", "date": "D", "meeting_time": "MT", "minute_taker": "MTK",
+        "executive_summary": "S",
+        "agenda_and_decisions": [
+            {"topic": "Topic", "discussion_summary": "Disc", "decisions_made": ["D1"]},
+        ],
+        "attendees": [{"name": "A", "designation": "CEO"}],
+        "action_items": [
+            {"task": "Task", "owner": "Owner", "department": "Dept",
+             "deadline": "TBD", "remarks": ""},
+        ],
+        "detected_speakers": [{"speaker_id": "S1", "inferred_name": "A"}],
+        "transcript": [
+            {"speaker": "A", "timestamp": "00:01",
+             "original_text": "orig", "translated_text": "trans"},
+        ],
+        "next_meeting_date": "NMD", "next_meeting_time": "NMT",
+        "next_meeting_agenda_focus": "NMAF", "closing_remarks": "CR",
+    }
 
 
 def body_xml(docx_bytes):
@@ -411,6 +435,205 @@ def test_every_mappable_field_exists_on_its_model():
                 f"used to render that table ({sorted(model_fields)})")
 
 
+def test_model_purge_on_placeholder_is_recovered():
+    """The live model also returned PURGE for this paragraph (same input, different
+    run). PURGE deletes the section permanently — that is the reported bug, so the
+    override must fire for PURGE too, not just KEEP_STATIC."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_7", "action": "PURGE", "cleaned_template_text": ""},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+
+    assert "{%p for item in action_items %}" in paras, (
+        f"PURGE on the ACTION ITEMS placeholder still deleted the section. "
+        f"paragraphs={paras!r}")
+    assert "{%p endfor %}" in paras, paras
+    assert "<Action Items Table goes here>" not in paras, paras
+
+    ctx = _ctx_for_render()
+    ctx["action_items"] = [
+        {"task": "Chairs repaired", "owner": "Nayab",
+         "department": "Admin", "deadline": "13 Sep", "remarks": ""},
+    ]
+    out = all_text(Document(io.BytesIO(render(tpl, ctx))))
+    assert "1. Chairs repaired — Nayab" in out, out
+
+
+def test_model_keep_static_on_placeholder_is_recovered():
+    """Real-world case: the live model classified the ACTION ITEMS placeholder as
+    KEEP_STATIC, so the client's placeholder text would ship into every generated
+    document and the section would never be filled. The assembler must detect it and
+    build the loop anyway."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_7", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+
+    assert "{%p for item in action_items %}" in paras, (
+        f"placeholder under the ACTION ITEMS heading was not recovered. "
+        f"paragraphs={paras!r}")
+    assert "{%p endfor %}" in paras, paras
+    assert "<Action Items Table goes here>" not in paras, (
+        "placeholder text still present in the template")
+
+    ctx = _ctx_for_render()
+    ctx["action_items"] = [
+        {"task": "Chairs repaired", "owner": "Nayab",
+         "department": "Admin", "deadline": "13 Sep", "remarks": ""},
+    ]
+    out = all_text(Document(io.BytesIO(render(tpl, ctx))))
+    assert "1. Chairs repaired — Nayab" in out, out
+    assert "<Action Items Table goes here>" not in out, out
+
+
+def test_placeholder_without_known_heading_is_removed_not_shipped():
+    """An unresolvable placeholder must never be printed into client output."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_7", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+    assert "<Action Items Table goes here>" not in paras, paras
+
+
+def test_edit_box_placeholder_resolves_by_heading_text():
+    """A differently-worded placeholder ('<<insert agenda here>>') must resolve via
+    its heading wording."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_19", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_20", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+    assert "{%p for entry in transcript %}" in paras, paras
+    assert "{%p endfor %}" in paras, paras
+
+
+def test_model_keep_static_on_real_dummy_text_is_preserved():
+    """Regression guard: the placeholder detector must not swallow ordinary text."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_12", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+    assert "Discussion/update on the tasks assigned;" in paras, paras
+    assert "{%p for" not in "\n".join(paras)
+
+
+# ---------------------------------------------------------------------------
+# Transient provider errors must not kill the upload
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None, content_type="application/json"):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = {"content-type": content_type}
+        self.text = json.dumps(self._payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """Returns the queued responses in order, one per post()."""
+
+    def __init__(self, responses, calls):
+        self._responses = responses
+        self._calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        self._calls.append(url)
+        idx = min(len(self._calls) - 1, len(self._responses) - 1)
+        return self._responses[idx]
+
+
+def _patch_client(monkeypatch, responses):
+    calls = []
+    monkeypatch.setattr(app.httpx, "Client",
+                        lambda **kw: _FakeClient(responses, calls))
+    monkeypatch.setattr(app.time, "sleep", lambda *a: None)
+    return calls
+
+
+def test_call_llm_json_retries_on_429(monkeypatch):
+    """A transient provider 429 must be retried, not raised. The client's upload
+    died with 'HTTP 429 from provider' before this: a temporary rate limit killed
+    the whole conversion."""
+    ok = {"choices": [{"message": {"content": '{"paragraphs": [], "tables": []}'}}]}
+    calls = _patch_client(monkeypatch, [_FakeResponse(429), _FakeResponse(200, ok)])
+    out = app.call_llm_json("https://x.invalid/v1", "k", "m", "p")
+    assert json.loads(out) == {"paragraphs": [], "tables": []}
+    assert len(calls) == 2, f"should have retried once, made {len(calls)} call(s)"
+
+
+def test_call_llm_json_retries_on_5xx(monkeypatch):
+    ok = {"choices": [{"message": {"content": "{}"}}]}
+    calls = _patch_client(monkeypatch,
+                          [_FakeResponse(503), _FakeResponse(502), _FakeResponse(200, ok)])
+    app.call_llm_json("https://x.invalid/v1", "k", "m", "p")
+    assert len(calls) == 3
+
+
+def test_call_llm_json_gives_up_after_max_attempts(monkeypatch):
+    calls = _patch_client(monkeypatch, [_FakeResponse(429)])
+    with pytest.raises(RuntimeError) as e:
+        app.call_llm_json("https://x.invalid/v1", "k", "m", "p")
+    assert "429" in str(e.value)
+    assert len(calls) <= 4, f"retried too many times: {len(calls)}"
+
+
+def test_call_llm_json_does_not_retry_client_errors(monkeypatch):
+    """401 (bad key) / 400 (bad request) are permanent — retrying wastes time and
+    hides the real problem."""
+    calls = _patch_client(monkeypatch, [_FakeResponse(401, {"error": "bad key"})])
+    with pytest.raises(RuntimeError) as e:
+        app.call_llm_json("https://x.invalid/v1", "k", "m", "p")
+    assert "401" in str(e.value)
+    assert len(calls) == 1, f"401 must not be retried, made {len(calls)} call(s)"
+
+
+def test_call_llm_json_retries_when_provider_streams_html(monkeypatch):
+    """9router returns text/event-stream unless stream:false — a non-JSON body is
+    transient noise, so retry it rather than failing the upload."""
+    ok = {"choices": [{"message": {"content": "{}"}}]}
+    calls = _patch_client(
+        monkeypatch,
+        [_FakeResponse(200, {}, content_type="text/event-stream"), _FakeResponse(200, ok)],
+    )
+    app.call_llm_json("https://x.invalid/v1", "k", "m", "p")
+    assert len(calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # End-to-end on the real sample: full data must round-trip
 # ---------------------------------------------------------------------------
@@ -456,3 +679,169 @@ def test_real_sample_end_to_end_roundtrip():
     assert "Saadat Khattak" in text
     assert "Wasim Kakakhel" in text
     assert media_parts(out) == media_parts(load_real())
+
+
+# ---------------------------------------------------------------------------
+# Collection SECTIONS in paragraphs (not tables)
+#
+# The client's minutes carry two extra sections whose content is a LIST, written
+# as a placeholder paragraph rather than a table:
+#
+#     ACTION ITEMS
+#     <Action Items Table goes here>
+#     ...
+#     COMPLETE DIARIZED TRANSCRIPT OF MEETING WITH TRANSLATION:
+#     The complete transcript with translation text goes here
+#
+# The schema could only express KEEP_STATIC / REPLACE_TEMPLATE / PURGE, so the
+# model classified each placeholder as PURGE (indistinguishable from dummy text)
+# and DELETED it. The headings survived, so the template looked plausible while
+# silently dropping both whole sections.
+# ---------------------------------------------------------------------------
+BODY_AI = ("{{ loop.index }}. {{ item.task }} — {{ item.owner }}"
+           " ({{ item.department }}, due {{ item.deadline }})")
+
+BODY_TX = ("[{{ entry.timestamp }}] {{ entry.speaker }}: "
+           "{{ entry.original_text }} ({{ entry.translated_text }})")
+
+
+def test_placeholder_paragraph_becomes_collection_loop():
+    """D14: a placeholder paragraph for a known collection must become a {%p for %}
+    loop over that collection, not be purged."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_7", "action": "REPLACE_TEMPLATE",
+             "collection": "action_items",
+             "cleaned_template_text": BODY_AI},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))          # must compile
+    doc = Document(io.BytesIO(tpl))
+    paras = [p.text for p in doc.paragraphs]
+
+    assert "{%p for item in action_items %}" in paras, (
+        f"no paragraph loop emitted for action_items. paragraphs={paras!r}")
+    assert "{%p endfor %}" in paras, "no closing paragraph loop tag"
+    # The tag paragraphs must be the tags ALONE — docxtpl only expands `{%p %}`
+    # when it is the entire paragraph, and any leftover placeholder text would
+    # otherwise be printed into every generated document.
+    assert BODY_AI in paras, (
+        f"loop body paragraph is not exactly the item text. paras={paras!r}")
+    for t in ("{%p for item in action_items %}", "{%p endfor %}"):
+        assert t in paras, f"{t!r} not alone in its own paragraph: {paras!r}"
+
+    # and it must actually render one line per item
+    ctx = _ctx_for_render()
+    ctx["action_items"] = [
+        {"task": "Chairs repaired", "owner": "Nayab",
+         "department": "Admin", "deadline": "13 Sep", "remarks": ""},
+        {"task": "Quotations", "owner": "Faisal",
+         "department": "Admin", "deadline": "TBD", "remarks": ""},
+    ]
+    out = all_text(Document(io.BytesIO(render(tpl, ctx))))
+    assert "1. Chairs repaired — Nayab (Admin, due 13 Sep)" in out, out
+    assert "2. Quotations — Faisal (Admin, due TBD)" in out, out
+    # The placeholder text must NOT survive anywhere.
+    assert "<Action Items Table goes here>" not in out, (
+        f"placeholder text leaked into output: {out!r}")
+
+
+def test_transcript_placeholder_becomes_loop():
+    """The transcript section must likewise become a loop over `transcript`."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_19", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_20", "action": "REPLACE_TEMPLATE",
+             "collection": "transcript",
+             "cleaned_template_text": BODY_TX},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    doc = Document(io.BytesIO(tpl))
+    paras = [p.text for p in doc.paragraphs]
+    assert "{%p for entry in transcript %}" in paras, paras
+    assert "{%p endfor %}" in paras, paras
+    assert BODY_TX in paras, f"loop body paragraph is not exact: {paras!r}"
+
+    ctx = _ctx_for_render()
+    ctx["transcript"] = [
+        {"speaker": "Saadat", "timestamp": "00:12",
+         "original_text": "Bismillah", "translated_text": "In the name of God"},
+    ]
+    out = all_text(Document(io.BytesIO(render(tpl, ctx))))
+    assert "[00:12] Saadat: Bismillah (In the name of God)" in out, out
+    assert "The complete transcript with translation text goes here" not in out, (
+        f"placeholder text leaked into output: {out!r}")
+
+
+def test_unknown_collection_is_not_looped():
+    """A bogus collection name must be rejected loudly rather than emitting a
+    loop that would crash on render (or silently produce nothing)."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_7", "action": "REPLACE_TEMPLATE",
+             "collection": "definitely_not_a_real_collection",
+             "cleaned_template_text": "{{ x.y }}"},
+        ],
+        "tables": [],
+    }
+    try:
+        tpl = convert(load_real(), plan)
+    except ValueError as e:
+        assert "collection" in str(e).lower(), e
+        return
+    # If it did not raise, the template must at least still compile.
+    DocxTemplate(io.BytesIO(tpl))
+    body = "\n".join(p.text for p in Document(io.BytesIO(tpl)).paragraphs)
+    assert "{%p for" not in body, f"emitted a loop for an unknown collection: {body!r}"
+
+
+def test_loop_body_uses_matching_variable():
+    """The body must use the variable name from the for-tag, or docxtpl renders
+    empty strings with no error."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_7", "action": "REPLACE_TEMPLATE",
+             "collection": "action_items",
+             "cleaned_template_text": "{{ item.task }}"},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    body = "\n".join(p.text for p in Document(io.BytesIO(tpl)).paragraphs)
+    m = re.search(r"\{%p for (\w+) in action_items %\}", body)
+    assert m, body
+    var = m.group(1)
+    assert "{{ item.task }}" in body, body
+    # the tag's own variable must be a known alias for that collection
+    assert var in ("item", "action_item", "a"), (
+        f"loop variable {var!r} will not match '{{{{ item.task }}}}' in the body")
+
+
+def test_purged_and_static_paragraphs_still_work():
+    """Regression: adding collection support must not break PURGE / KEEP_STATIC /
+    plain REPLACE_TEMPLATE."""
+    plan = {
+        "paragraphs": [
+            {"p_id": "p_6", "action": "PURGE"},
+            {"p_id": "p_12", "action": "PURGE"},
+            {"p_id": "p_9", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": "p_17", "action": "REPLACE_TEMPLATE",
+             "cleaned_template_text": "CLOSING\n{{ closing_remarks }}"},
+        ],
+        "tables": [],
+    }
+    tpl = convert(load_real(), plan)
+    DocxTemplate(io.BytesIO(tpl))
+    body = "\n".join(p.text for p in Document(io.BytesIO(tpl)).paragraphs)
+    assert "ACTION ITEMS" not in body, "PURGE ignored"
+    assert "Discussion/update on the tasks assigned;" not in body, "PURGE ignored"
+    assert "Date:\u00a011/09/2026" in body, "KEEP_STATIC paragraph lost"
+    assert "{{ closing_remarks }}" in body, "plain REPLACE_TEMPLATE lost"
+    assert "{%p for" not in body
+
