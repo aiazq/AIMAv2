@@ -415,7 +415,7 @@ def main():
             mime = audio_file.type if audio_file.type else "audio/mp3"
 
             report = analyze_meeting_audio_rest(
-                audio_bytes=audio_bytes,
+                audio_file_bytes=audio_bytes,
                 mime_type=mime,
                 api_key=active_api_key,
                 endpoint_url=active_endpoint,
