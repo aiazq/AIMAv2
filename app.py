@@ -283,20 +283,25 @@ def analyze_meeting_audio_rest(
 
     res_json = response.json()
 
-    # Extract Usage Telemetry
+    # Extract Usage Telemetry (including thoughts/reasoning tokens)
     prompt_tokens = 0
     completion_tokens = 0
+    thoughts_tokens = 0
     total_tokens = 0
 
     if "usageMetadata" in res_json:  # Gemini Native
         usage = res_json["usageMetadata"]
         prompt_tokens = usage.get("promptTokenCount", 0)
         completion_tokens = usage.get("candidatesTokenCount", 0)
+        thoughts_tokens = usage.get("thoughtsTokenCount", 0)
         total_tokens = usage.get("totalTokenCount", 0)
     elif "usage" in res_json:  # OpenAI / Compatible
         usage = res_json["usage"]
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
+        # Check for reasoning_tokens inside completion_tokens_details if available
+        details = usage.get("completion_tokens_details", {})
+        thoughts_tokens = details.get("reasoning_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
 
     # Extract Content
@@ -323,17 +328,25 @@ def analyze_meeting_audio_rest(
     stats = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "thoughts_tokens": thoughts_tokens,
         "total_tokens": total_tokens,
         "latency": latency,
         "speed": tok_per_sec,
         "model": model_name,
     }
 
-    log_event(
-        log_container,
-        logs_list,
-        f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output) | {latency:.2f}s",
-    )
+    if thoughts_tokens > 0:
+        log_event(
+            log_container,
+            logs_list,
+            f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output + {thoughts_tokens:,} thinking) | {latency:.2f}s",
+        )
+    else:
+        log_event(
+            log_container,
+            logs_list,
+            f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output) | {latency:.2f}s",
+        )
 
     progress_bar.progress(100)
     status_text.text("Processing Complete!")
@@ -592,17 +605,40 @@ def main():
         log_container = st.empty()
         log_container.code("\n".join(st.session_state["logs_list"]), language="log")
 
-        # Usage Statistics Panel
+        # Telemetry & Usage Statistics Display
         stats = st.session_state.get("usage_stats")
         if stats:
             st.markdown("##### 📊 Telemetry & Usage Stats")
-            u_col1, u_col2 = st.columns(2)
-            with u_col1:
-                st.metric("Prompt Tokens", f"{stats['prompt_tokens']:,}")
-                st.metric("Total Tokens", f"{stats['total_tokens']:,}")
-            with u_col2:
-                st.metric("Output Tokens", f"{stats['completion_tokens']:,}")
-                st.metric("Latency", f"{stats['latency']:.2f}s", f"{stats['speed']:.1f} tok/s" if stats['speed'] > 0 else None)
+
+            has_thoughts = stats.get("thoughts_tokens", 0) > 0
+
+            # Grid 1: Token Breakdown
+            if has_thoughts:
+                t_cols = st.columns(4)
+                with t_cols[0]:
+                    st.metric("Prompt", f"{stats['prompt_tokens']:,}")
+                with t_cols[1]:
+                    st.metric("Output", f"{stats['completion_tokens']:,}")
+                with t_cols[2]:
+                    st.metric("Thinking", f"{stats['thoughts_tokens']:,}")
+                with t_cols[3]:
+                    st.metric("Total Tokens", f"{stats['total_tokens']:,}")
+            else:
+                t_cols = st.columns(3)
+                with t_cols[0]:
+                    st.metric("Prompt", f"{stats['prompt_tokens']:,}")
+                with t_cols[1]:
+                    st.metric("Output", f"{stats['completion_tokens']:,}")
+                with t_cols[2]:
+                    st.metric("Total Tokens", f"{stats['total_tokens']:,}")
+
+            # Grid 2: Performance Metrics
+            p_cols = st.columns(2)
+            with p_cols[0]:
+                st.metric("Latency", f"{stats['latency']:.2f}s")
+            with p_cols[1]:
+                speed_str = f"{stats['speed']:.1f} tok/s" if stats['speed'] > 0 else "N/A"
+                st.metric("Speed", speed_str)
 
         if run_clicked:
             active_key = st.session_state.get("api_key")
