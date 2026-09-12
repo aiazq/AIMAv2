@@ -1,4 +1,5 @@
 import base64
+import datetime
 import io
 import json
 import os
@@ -18,7 +19,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Default complete endpoint URL and model
 DEFAULT_ENDPOINT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_ENDPOINT = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_ENDPOINT_URL))
@@ -28,6 +28,9 @@ if "api_key" not in st.session_state:
 
 if "endpoint_url" not in st.session_state:
     st.session_state["endpoint_url"] = SECRET_ENDPOINT
+
+if "saved_template_bytes" not in st.session_state:
+    st.session_state["saved_template_bytes"] = None
 
 
 # -----------------------------------------------------------------------------
@@ -63,8 +66,15 @@ class MeetingMinutesReport(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Universal API Dispatcher (Google Gemini REST & OpenAI-Compatible Audio Chat)
+# Real-time Event Logger & Audio Dispatcher
 # -----------------------------------------------------------------------------
+def log_event(log_container, logs_list, message: str, level: str = "INFO"):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    formatted_log = f"[{ts}] [{level}] {message}"
+    logs_list.append(formatted_log)
+    log_container.code("\n".join(logs_list), language="log")
+
+
 def analyze_meeting_audio_rest(
     audio_file_bytes: bytes,
     mime_type: str,
@@ -72,14 +82,22 @@ def analyze_meeting_audio_rest(
     endpoint_url: str,
     progress_bar,
     status_text,
+    log_container,
+    logs_list,
 ) -> MeetingMinutesReport:
-    """Dispatches audio to the designated complete endpoint URL."""
-    status_text.text("Step 1/3: Encoding audio buffer...")
-    progress_bar.progress(20)
+    file_size_mb = len(audio_file_bytes) / (1024 * 1024)
+    log_event(log_container, logs_list, f"Received audio stream. Size: {file_size_mb:.2f} MB | Detected MIME: {mime_type}")
 
+    status_text.text("Step 1/3: Encoding audio buffer to Base64...")
+    progress_bar.progress(15)
+    log_event(log_container, logs_list, "Encoding raw audio binary to Base64 representation...")
+
+    b64_start = time.time()
     b64_audio = base64.b64encode(audio_file_bytes).decode("utf-8")
-    progress_bar.progress(40)
+    b64_duration = time.time() - b64_start
+    log_event(log_container, logs_list, f"Base64 encoding completed in {b64_duration:.2f}s ({len(b64_audio):,} characters).")
 
+    progress_bar.progress(35)
     prompt = (
         "You are an executive meeting assistant. Listen carefully to this meeting audio recording:\n"
         "1. Produce a full diarized transcript identifying distinct speakers.\n"
@@ -90,13 +108,15 @@ def analyze_meeting_audio_rest(
         + json.dumps(MeetingMinutesReport.model_json_schema())
     )
 
-    status_text.text(f"Step 2/3: Contacting endpoint ({endpoint_url})...")
-
-    # Determine protocol based on endpoint structure
     is_gemini_native = "googleapis.com" in endpoint_url
+    log_event(
+        log_container,
+        logs_list,
+        f"Target protocol identified: {'Google Gemini REST' if is_gemini_native else 'OpenAI-compatible Audio'}",
+    )
+    log_event(log_container, logs_list, f"Target Endpoint URL: {endpoint_url}")
 
     if is_gemini_native:
-        # Full Gemini REST payload
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": api_key,
@@ -121,11 +141,11 @@ def analyze_meeting_audio_rest(
             },
         }
     else:
-        # OpenAI-compatible / Custom endpoint payload with input audio
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        audio_fmt = mime_type.split("/")[-1].replace("mpeg", "mp3")
         payload = {
             "messages": [
                 {
@@ -136,7 +156,7 @@ def analyze_meeting_audio_rest(
                             "type": "input_audio",
                             "input_audio": {
                                 "data": b64_audio,
-                                "format": mime_type.split("/")[-1].replace("mpeg", "mp3"),
+                                "format": audio_fmt,
                             },
                         },
                     ],
@@ -146,26 +166,41 @@ def analyze_meeting_audio_rest(
             "temperature": 0.2,
         }
 
+    status_text.text("Step 2/3: Transcribing, diarizing, and analyzing audio on remote model...")
+    progress_bar.progress(50)
+    log_event(log_container, logs_list, "Dispatching HTTP POST request to provider. Awaiting model inference...")
+
+    req_start = time.time()
     with httpx.Client(timeout=300.0) as client:
         response = client.post(endpoint_url, headers=headers, json=payload)
+    req_duration = time.time() - req_start
+
+    log_event(
+        log_container,
+        logs_list,
+        f"Provider responded in {req_duration:.2f}s with HTTP Status: {response.status_code}",
+        level="INFO" if response.status_code == 200 else "ERROR",
+    )
 
     if response.status_code != 200:
+        log_event(log_container, logs_list, f"Error Response Body: {response.text}", level="ERROR")
         raise RuntimeError(f"HTTP {response.status_code} from provider: {response.text}")
 
     progress_bar.progress(85)
-    status_text.text("Step 3/3: Parsing structured meeting minutes...")
+    status_text.text("Step 3/3: Deserializing JSON output and validating schema...")
+    log_event(log_container, logs_list, "Extracting payload content from HTTP response...")
 
     res_json = response.json()
-
-    # Extract raw text depending on provider response layout
     if "candidates" in res_json:
         raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        log_event(log_container, logs_list, "Extracted candidate text from Google Generative Language schema.")
     elif "choices" in res_json:
         raw_text = res_json["choices"][0]["message"]["content"]
+        log_event(log_container, logs_list, "Extracted choice message from OpenAI-compatible chat schema.")
     else:
         raw_text = json.dumps(res_json)
+        log_event(log_container, logs_list, "Raw response parsed directly as JSON string.")
 
-    # Clean potential markdown fences from non-enforcing endpoints
     cleaned_json = raw_text.strip()
     if cleaned_json.startswith("```json"):
         cleaned_json = cleaned_json[7:]
@@ -174,33 +209,55 @@ def analyze_meeting_audio_rest(
     if cleaned_json.endswith("```"):
         cleaned_json = cleaned_json[:-3]
 
+    log_event(log_container, logs_list, "Validating schema against MeetingMinutesReport Pydantic model...")
     parsed_data = json.loads(cleaned_json.strip())
     report = MeetingMinutesReport(**parsed_data)
 
+    log_event(
+        log_container,
+        logs_list,
+        f"Extraction success: Detected {len(report.attendees)} attendees, {len(report.agenda_and_decisions)} agenda topics, {len(report.action_items)} action items, and {len(report.transcript)} diarized lines.",
+    )
+
     progress_bar.progress(100)
     status_text.text("Processing Complete!")
-    time.sleep(0.5)
+    log_event(log_container, logs_list, "Ready for report review and DOCX generation.")
+    time.sleep(0.3)
     return report
 
 
 # -----------------------------------------------------------------------------
-# DOCX Dynamic Parser and Builders
+# Robust Template Conversion & Rendering Engines
 # -----------------------------------------------------------------------------
 def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
+    """Scans sample DOCX paragraphs and tables, inserting docxtpl Jinja tags."""
     doc = Document(io.BytesIO(sample_bytes))
 
-    for p in doc.paragraphs:
-        txt = p.text.lower()
-        if any(w in txt for w in ["summary", "overview", "background"]):
+    def replace_keywords_in_paragraph(p):
+        txt = p.text.strip().lower()
+        if not txt:
+            return
+        if any(w in txt for w in ["executive summary", "overview", "background", "summary:"]):
             p.text = "{{ executive_summary }}"
-        elif any(w in txt for w in ["attendees", "participants", "present"]):
-            p.text = "{% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}"
-        elif any(w in txt for w in ["date", "meeting date"]):
+        elif any(w in txt for w in ["attendees", "participants", "present:"]):
+            p.text = "Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}"
+        elif any(w in txt for w in ["meeting date", "date:"]):
             p.text = "Date: {{ date }}"
-        elif any(w in txt for w in ["title", "subject", "meeting:"]):
+        elif any(w in txt for w in ["meeting title", "subject:", "title:"]):
             p.text = "{{ title }}"
 
+    # 1. Inspect main body paragraphs
+    for p in doc.paragraphs:
+        replace_keywords_in_paragraph(p)
+
+    # 2. Inspect tables (cells and action item structures)
     for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    replace_keywords_in_paragraph(p)
+
+        # Detect action items table
         if len(table.rows) >= 2:
             first_row_txt = " ".join(c.text.lower() for c in table.rows[0].cells)
             if any(w in first_row_txt for w in ["task", "action", "owner", "assignee", "due"]):
@@ -212,14 +269,14 @@ def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
                 new_row = table.add_row()
                 cells = new_row.cells
                 if len(cells) >= 4:
-                    cells[0].text = "{% for item in action_items %}{{ item.task }}"
+                    cells[0].text = "{%tr for item in action_items %}{{ item.task }}"
                     cells[1].text = "{{ item.owner }}"
                     cells[2].text = "{{ item.deadline }}"
-                    cells[3].text = "{{ item.priority }}{% endfor %}"
+                    cells[3].text = "{{ item.priority }}{%tr endfor %}"
                 elif len(cells) >= 3:
-                    cells[0].text = "{% for item in action_items %}{{ item.task }}"
+                    cells[0].text = "{%tr for item in action_items %}{{ item.task }}"
                     cells[1].text = "{{ item.owner }}"
-                    cells[2].text = "{{ item.deadline }}{% endfor %}"
+                    cells[2].text = "{{ item.deadline }}{%tr endfor %}"
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -296,13 +353,12 @@ def main():
 
     with top_col:
         st.title("🎙️ AIMA — AI Meeting Assistant")
-        st.caption("Custom endpoint meeting assistant: transcripts, action items, and DOCX templates.")
+        st.caption("Universal meeting assistant: transcripts, action items, and DOCX templates.")
 
     with settings_col:
         with st.popover("⚙️ Settings"):
             st.markdown("### Endpoint & Security")
 
-            # Scoped CSS to permanently strip password-reveal buttons/eyes across browsers
             st.markdown(
                 """
                 <style>
@@ -319,7 +375,6 @@ def main():
                 unsafe_allow_html=True,
             )
 
-            # Masked write-only API key field
             has_key = bool(st.session_state.get("api_key"))
             status_indicator = "🟢 Key is securely set" if has_key else "🔴 No key configured"
             st.caption(f"Status: **{status_indicator}**")
@@ -336,12 +391,11 @@ def main():
                 st.session_state["api_key"] = new_key_input.strip()
                 st.rerun()
 
-            # Complete Endpoint URL Input
             current_endpoint = st.session_state.get("endpoint_url", DEFAULT_ENDPOINT_URL)
             new_endpoint = st.text_input(
                 "Complete Meeting Endpoint URL:",
                 value=current_endpoint,
-                help="Enter the full target URL (e.g., [https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions) or your custom proxy/gateway).",
+                help="Enter the full target URL (e.g., [https://generativelanguage.googleapis.com/](https://generativelanguage.googleapis.com/)... or [https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)).",
             )
             if new_endpoint != current_endpoint:
                 st.session_state["endpoint_url"] = new_endpoint.strip()
@@ -367,12 +421,14 @@ def main():
             horizontal=True,
         )
 
-        template_bytes = None
+        if doc_choice == "Default Clean Format":
+            st.session_state["active_template_bytes"] = None
 
-        if doc_choice == "Upload Jinja2-Tagged .docx":
+        elif doc_choice == "Upload Jinja2-Tagged .docx":
             uploaded_tpl = st.file_uploader("Upload Word Template (.docx)", type=["docx"], key="tagged_docx")
             if uploaded_tpl:
-                template_bytes = uploaded_tpl.getvalue()
+                st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
+                st.success("Custom Jinja2 template loaded.")
 
         elif doc_choice == "Convert a Completed Sample .docx into Template":
             sample_file = st.file_uploader(
@@ -384,7 +440,8 @@ def main():
             if sample_file:
                 with st.spinner("Analyzing document structure and creating template..."):
                     try:
-                        template_bytes = convert_sample_docx_to_template(sample_file.getvalue()).getvalue()
+                        converted_io = convert_sample_docx_to_template(sample_file.getvalue())
+                        st.session_state["active_template_bytes"] = converted_io.getvalue()
                         st.success("Successfully generated dynamic template from sample!")
                     except Exception as err:
                         st.error(f"Failed to parse sample docx: {err}")
@@ -410,7 +467,12 @@ def main():
         progress_bar = st.progress(0)
         status_text = st.empty()
 
+        with st.expander("🔍 Real-time Execution Logs", expanded=True):
+            log_container = st.empty()
+            logs_list = []
+
         try:
+            log_event(log_container, logs_list, "Starting execution pipeline...")
             audio_bytes = audio_file.read()
             mime = audio_file.type if audio_file.type else "audio/mp3"
 
@@ -421,9 +483,12 @@ def main():
                 endpoint_url=active_endpoint,
                 progress_bar=progress_bar,
                 status_text=status_text,
+                log_container=log_container,
+                logs_list=logs_list,
             )
             st.session_state["meeting_result"] = report
-            st.session_state["saved_template_bytes"] = template_bytes
+            # Persist the selected template explicitly into the session results
+            st.session_state["saved_template_bytes"] = st.session_state.get("active_template_bytes")
 
         except Exception as e:
             progress_bar.empty()
