@@ -20,26 +20,22 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Custom Styling for Split Workstation View
+# Custom Styling for Workstation View and Button Positioning
 st.markdown(
     """
     <style>
-    /* Compact, clean padding */
+    /* Ensure header controls are fully visible below Streamlit's native header */
     .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
+        padding-top: 3.2rem !important;
+        padding-bottom: 2rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
         max-width: 100% !important;
     }
 
-    /* Card containers */
-    .stCard {
-        background-color: var(--secondary-background-color);
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 8px;
-        padding: 1.25rem;
-        margin-bottom: 1rem;
+    /* Additional spacing for the settings popover trigger */
+    div[data-testid="stPopover"] {
+        margin-top: 0.35rem;
     }
 
     /* Remove Streamlit password reveal eyes */
@@ -456,18 +452,18 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 
 
 # -----------------------------------------------------------------------------
-# Main Application (Split Desktop Workstation Layout)
+# Main Application
 # -----------------------------------------------------------------------------
 def main():
-    # Top Header Strip
-    h_col1, h_col2 = st.columns([0.85, 0.15])
+    # Top Header Strip with clean vertical alignment
+    h_col1, h_col2 = st.columns([0.82, 0.18], vertical_alignment="center")
     with h_col1:
         st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
     with h_col2:
-        with st.popover("⚙️ API Settings", use_container_width=True):
-            st.markdown("**Provider Credentials**")
+        with st.popover("⚙️ Settings", use_container_width=True):
+            st.markdown("**Provider & Model Settings**")
             has_key = bool(st.session_state.get("api_key"))
-            st.caption(f"Status: {'🟢 Configured' if has_key else '🔴 Not Set'}")
+            st.caption(f"Status: {'🟢 Key is Set' if has_key else '🔴 No Key Set'}")
 
             new_key = st.text_input(
                 "API Key / Token:",
@@ -480,9 +476,32 @@ def main():
                 st.rerun()
 
             current_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
-            new_base = st.text_input("Provider Endpoint URL:", value=current_base)
+            new_base = st.text_input(
+                "Provider Endpoint URL:",
+                value=current_base,
+                help="Base URL without model path (e.g., [https://generativelanguage.googleapis.com/v1beta](https://generativelanguage.googleapis.com/v1beta) or [https://api.openai.com/v1](https://api.openai.com/v1))",
+            )
             if new_base != current_base:
                 st.session_state["base_url"] = new_base.strip()
+                st.session_state["available_models"] = fetch_available_models(
+                    st.session_state["base_url"], st.session_state.get("api_key", "")
+                )
+                st.rerun()
+
+            st.markdown("---")
+
+            # Model Selection inside Settings
+            models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
+            curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
+            idx = models_list.index(curr_model) if curr_model in models_list else 0
+
+            st.session_state["selected_model"] = st.selectbox(
+                "Active AI Model:",
+                options=models_list,
+                index=idx,
+            )
+
+            if st.button("🔄 Refresh Models List", use_container_width=True):
                 st.session_state["available_models"] = fetch_available_models(
                     st.session_state["base_url"], st.session_state.get("api_key", "")
                 )
@@ -498,30 +517,11 @@ def main():
         st.markdown("#### 🎛️ Input Controls")
 
         with st.container():
-            # Model Selector
-            m_col1, m_col2 = st.columns([0.78, 0.22])
-            with m_col1:
-                models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
-                curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
-                idx = models_list.index(curr_model) if curr_model in models_list else 0
-                st.session_state["selected_model"] = st.selectbox(
-                    "Model:",
-                    options=models_list,
-                    index=idx,
-                    label_visibility="collapsed",
-                )
-            with m_col2:
-                if st.button("🔄", help="Refresh models from endpoint"):
-                    st.session_state["available_models"] = fetch_available_models(
-                        st.session_state["base_url"], st.session_state.get("api_key", "")
-                    )
-                    st.rerun()
-
             # Audio Ingest
             audio_file = st.file_uploader(
                 "Upload Meeting Recording",
                 type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
-                help="Supports all major audio containers.",
+                help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
             )
             if audio_file:
                 st.audio(audio_file)
@@ -571,7 +571,7 @@ def main():
             active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
 
             if not active_key:
-                st.error("Missing API Key. Open ⚙️ API Settings to configure one.")
+                st.error("Missing API Key. Open ⚙️ Settings in the top header to configure one.")
                 return
 
             if not audio_file:
@@ -612,8 +612,7 @@ def main():
     # =========================================================================
     with col_right:
         if "meeting_result" not in st.session_state:
-            # Standby Placeholder
-            st.info("👈 Upload meeting audio and select your template strategy on the left to generate the minutes document.")
+            st.info("👈 Upload meeting audio and select your template on the left to generate the minutes document.")
             st.markdown(
                 """
                 ```
@@ -639,7 +638,6 @@ def main():
                 st.markdown(f"## {result.title}")
                 st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(result.attendees)}")
             with t_col2:
-                # Instant download action
                 if active_template:
                     try:
                         doc_io = render_template_docx(active_template, result)
@@ -657,7 +655,7 @@ def main():
                     type="primary",
                 )
 
-            # Speaker Mapping Component (Context-aware bar above tabs)
+            # Speaker Mapping Component
             raw_speakers = sorted(list({entry.speaker for entry in result.transcript}))
             inferred_lookup = {ds.speaker_id: ds.inferred_name for ds in getattr(result, "detected_speakers", [])}
 
