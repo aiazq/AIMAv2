@@ -485,9 +485,9 @@ _COLUMN_KEYWORDS = [
     (("designation", "role", "title", "position", "desig", "rank"), "designation"),
     (("name", "participant", "attendee", "person", "member"), "name"),
     # action-item columns
-    # NOTE: in this client's minutes "AP" is the ASSIGNED PERSON column, NOT
-    # "Action Point". Confirmed against the client's sample document, where every
-    # AP value is a person ("Nayab, Faisal", "Saadat sb, Ali Ud Din", "All staff").
+    # NOTE: in this document's minutes "AP" is the ASSIGNED PERSON column, NOT
+    # "Action Point". Confirmed against the sample document, where every AP value
+    # is a person ("Person A, Person B", "Person C", "All staff").
     # The work itself lives in the "Agenda Items" column.
     (("owner", "responsible", "resp", "assigned", "assignee", "who", "ap"), "owner"),
     # the work being tracked: "Agenda Items", "Discussion", "Topic" -> item.task
@@ -1206,7 +1206,7 @@ def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> i
 
     # autoescape=True is REQUIRED: with docxtpl's default (False), user data
     # containing '&', '<' or '>' is silently mangled or dropped, producing invalid
-    # or lossy XML. E.g. 'Sarhad Chamber & ISO 14001' -> 'Sarhad Chamber  ISO 14001' (D11).
+    # or lossy XML. E.g. 'Org & Partner Ltd' -> 'Org  Partner Ltd' (D11).
     doc.render(context, autoescape=True)
     out_stream = io.BytesIO()
     doc.save(out_stream)
