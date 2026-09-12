@@ -333,17 +333,82 @@ def test_real_sample_action_columns_map_semantically():
             break
     assert tpl_row is not None, "no template row emitted"
 
-    # 'AP' (action point) column is index 2 -> must be the TASK, not the owner
+    # 'AP' = the ASSIGNED PERSON in this client's minutes (confirmed by the client),
+    # NOT "action point". It must therefore map to `owner`.
     idx_ap = hdr.index("AP") if "AP" in hdr else None
     if idx_ap is not None:
-        assert "task" in tpl_row[idx_ap], (
-            f"AP column got {tpl_row[idx_ap]!r}, expected the task variable. "
+        assert "owner" in tpl_row[idx_ap], (
+            f"AP column got {tpl_row[idx_ap]!r}, expected the owner variable. "
+            f"headers={hdr} row={tpl_row}")
+        assert "task" not in tpl_row[idx_ap], (
+            f"AP must not map to task: {tpl_row[idx_ap]!r}")
+    # 'Agenda Items' carries the work description -> item.task (it used to map to
+    # `item.topic`, a field ActionItem does not have, so the column rendered BLANK)
+    idx_ag = hdr.index("Agenda Items") if "Agenda Items" in hdr else None
+    if idx_ag is not None:
+        assert "task" in tpl_row[idx_ag], (
+            f"Agenda Items column got {tpl_row[idx_ag]!r}, expected the task variable. "
             f"headers={hdr} row={tpl_row}")
     # 'Remarks' column -> remarks variable
     idx_rem = hdr.index("Remarks") if "Remarks" in hdr else None
     if idx_rem is not None:
         assert "remarks" in tpl_row[idx_rem], (
             f"Remarks column got {tpl_row[idx_rem]!r}. headers={hdr} row={tpl_row}")
+
+
+# ---------------------------------------------------------------------------
+# AP = assigned person (client-confirmed), exact-match only
+# ---------------------------------------------------------------------------
+def test_ap_header_maps_to_owner():
+    """The client's 'AP' column holds the ASSIGNED PERSON, so it must map to
+    `owner` — not to `task` ('action point'), which is how the code once read it
+    and which put a person's name in the work column."""
+    assert app.map_header_to_variable("AP", "ACTION_ITEMS_TABLE") == "owner"
+    assert app.map_header_to_variable("ap", "ACTION_ITEMS_TABLE") == "owner"
+    assert app.map_header_to_variable("AP.", "ACTION_ITEMS_TABLE") == "owner"
+
+
+def test_ap_keyword_does_not_capture_unrelated_headers():
+    """'ap' is a dangerous 2-letter key: it must never match by prefix/substring,
+    or headers like 'Approved' would be filled with the owner variable."""
+    for h in ("Approved", "Application", "App", "Approval Status", "Capability"):
+        got = app.map_header_to_variable(h, "ACTION_ITEMS_TABLE")
+        assert got != "owner", f"{h!r} wrongly mapped to owner (got {got!r})"
+
+
+def test_agenda_items_maps_to_task_not_dead_field():
+    """'Agenda Items' carries the work -> item.task.
+
+    It previously mapped to `item.topic`, a field ActionItem does not define, so
+    the column rendered EMPTY with no error. Guard against that regression: the
+    mapped variable must be a real, non-empty ActionItem field.
+    """
+    field = app.map_header_to_variable("Agenda Items", "ACTION_ITEMS_TABLE")
+    assert field == "task"
+    assert field in app.ActionItem.model_fields, (
+        f"mapped field {field!r} is not a real ActionItem field "
+        f"({sorted(app.ActionItem.model_fields)})")
+
+
+def test_every_mappable_field_exists_on_its_model():
+    """No header may map to a field the render context does not actually provide,
+    which is how a column silently renders blank."""
+    attendee_fields = set(app.Attendee.model_fields)
+    item_fields = set(app.ActionItem.model_fields)
+    samples = {
+        "ATTENDEES_TABLE": (["Sr.#", "Name", "Designation"], attendee_fields),
+        "ACTION_ITEMS_TABLE": (
+            ["Sr.#", "Agenda Items", "AP", "Department", "Deadline", "Remarks"],
+            item_fields),
+    }
+    for table_type, (headers, model_fields) in samples.items():
+        for h in headers:
+            f = app.map_header_to_variable(h, table_type)
+            if f in (None, "@index"):
+                continue
+            assert f in model_fields, (
+                f"header {h!r} maps to {f!r}, which is not a field of the model "
+                f"used to render that table ({sorted(model_fields)})")
 
 
 # ---------------------------------------------------------------------------

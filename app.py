@@ -155,7 +155,10 @@ class Attendee(BaseModel):
 
 
 class ActionItem(BaseModel):
-    task: str = Field(description="Description of the action item or task.")
+    task: str = Field(
+        description=("Description of the action item or task, i.e. the work being "
+                     "tracked (the 'Agenda Items' column of a minutes table)."),
+    )
     owner: str = Field(description="Person, role, or team assigned to this task.")
     department: str = Field(default="", description="Relevant department or team if identifiable.")
     deadline: str = Field(description="Due date, timeframe, or 'TBD' if unspecified.")
@@ -395,18 +398,28 @@ _COLUMN_KEYWORDS = [
     (("designation", "role", "title", "position", "desig", "rank"), "designation"),
     (("name", "participant", "attendee", "person", "member"), "name"),
     # action-item columns
-    (("agenda", "topic", "discussion", "subject", "point"), "topic"),
-    (("action", "ap", "task", "activity", "description", "work"), "task"),
-    (("owner", "responsible", "resp", "assigned", "assignee", "who"), "owner"),
+    # NOTE: in this client's minutes "AP" is the ASSIGNED PERSON column, NOT
+    # "Action Point". Confirmed against the client's sample document, where every
+    # AP value is a person ("Nayab, Faisal", "Saadat sb, Ali Ud Din", "All staff").
+    # The work itself lives in the "Agenda Items" column.
+    (("owner", "responsible", "resp", "assigned", "assignee", "who", "ap"), "owner"),
+    # the work being tracked: "Agenda Items", "Discussion", "Topic" -> item.task
+    (("agenda item", "agenda", "discussion", "topic", "subject", "point"), "task"),
+    # fallback aliases for the task column
+    (("task", "action", "activity", "description", "work"), "task"),
     (("department", "dept", "division", "section", "unit"), "department"),
     (("deadline", "dead line", "due", "date", "timeline", "target"), "deadline"),
     (("remark", "comment", "note", "status", "priority"), "remarks"),
 ]
 
+# Keys that must match the header EXACTLY (never as a prefix/substring).
+# Without this, the key "ap" would also capture headers like "Approved".
+_EXACT_ONLY = {"#", "ap"}
+
 # Which fields are meaningful for each table type. Anything else is not mapped.
 _TABLE_FIELDS = {
     "ATTENDEES_TABLE": {"@index", "name", "designation"},
-    "ACTION_ITEMS_TABLE": {"@index", "topic", "task", "owner", "department",
+    "ACTION_ITEMS_TABLE": {"@index", "task", "owner", "department",
                            "deadline", "remarks"},
 }
 
@@ -420,6 +433,9 @@ def map_header_to_variable(header: str, table_type: str) -> str | None:
 
     Returns None when the column has no known semantic for this table type, so the
     column is left as a literal rather than being silently filled with wrong data.
+
+    Matching is exact-first, then longest-key-first substring. Longest-first matters
+    so that "agenda item" wins over the shorter "agenda" on the same header.
     """
     h = _norm_header(header)
     if not h:
@@ -427,22 +443,24 @@ def map_header_to_variable(header: str, table_type: str) -> str | None:
     allowed = _TABLE_FIELDS.get(table_type)
     if allowed is None:
         return None
-    for keys, field in _COLUMN_KEYWORDS:
-        if field not in allowed:
-            continue
+
+    fields = [(keys, field) for keys, field in _COLUMN_KEYWORDS if field in allowed]
+    # 1) exact match wins. For _EXACT_ONLY keys we allow only trailing punctuation
+    #    ("AP." / "AP:"), never a longer word ("Approved"), so the key stays safe.
+    h_stripped = h.rstrip(".:#/- ")
+    for keys, field in fields:
         for k in keys:
-            if k == "#":
-                if h == "#":
-                    return field
-                continue
-            # exact match first, then prefix, then substring
-            if h == k:
+            if h == k or (k in _EXACT_ONLY and h_stripped == k):
                 return field
-        for k in keys:
-            if k == "#":
-                continue
-            if h.startswith(k) or k in h:
-                return field
+    # 2) otherwise longest key first, so "agenda item" beats "agenda"
+    candidates = sorted(
+        ((k, field) for keys, field in fields for k in keys if k not in _EXACT_ONLY),
+        key=lambda kf: len(kf[0]),
+        reverse=True,
+    )
+    for k, field in candidates:
+        if h.startswith(k) or k in h:
+            return field
     return None
 
 
@@ -659,6 +677,11 @@ STRICT RULES:
      * 'ACTION_ITEMS_TABLE' if it lists agenda points/tasks (Agenda Items, AP, Dead line, Remarks).
      * 'STATIC_TABLE' otherwise.
    - header_rows_count: usually 1.
+   - Column semantics are resolved by HEADER TEXT at conversion time, so do NOT
+     guess column positions. Note that in these minutes the 'AP' column holds the
+     ASSIGNED PERSON (owner), and 'Agenda Items' holds the work itself: put the
+     person from the 'AP' column in `owner` and the work from 'Agenda Items' in
+     `task`.
 
 Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
 {json.dumps(DocumentAnalysisPlan.model_json_schema())}
