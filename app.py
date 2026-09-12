@@ -144,13 +144,19 @@ FUNNY_QUIPS = [
 
 
 # -----------------------------------------------------------------------------
-# Pydantic Schemas
+# Data Schemas
 # -----------------------------------------------------------------------------
+class Attendee(BaseModel):
+    name: str = Field(description="Full name of attendee.")
+    designation: str = Field(default="", description="Role or title if mentioned, otherwise empty.")
+
+
 class ActionItem(BaseModel):
     task: str = Field(description="Description of the action item or task.")
     owner: str = Field(description="Person, role, or team assigned to this task.")
+    department: str = Field(default="", description="Relevant department or team if identifiable.")
     deadline: str = Field(description="Due date, timeframe, or 'TBD' if unspecified.")
-    priority: str = Field(description="High, Medium, or Low.")
+    priority: str = Field(description="High, Medium, Low, or key remarks.")
 
 
 class TranscriptEntry(BaseModel):
@@ -174,7 +180,9 @@ class DetectedSpeaker(BaseModel):
 class MeetingMinutesReport(BaseModel):
     title: str = Field(description="Descriptive title for the meeting.")
     date: str = Field(description="Date of the meeting or 'Undated'.")
-    attendees: list[str] = Field(description="Detected participants.")
+    meeting_time: str = Field(default="", description="Meeting time range if mentioned.")
+    minute_taker: str = Field(default="", description="Minute taker(s) if specified.")
+    attendees: list[Attendee] = Field(description="Detected participants with designations.")
     detected_speakers: list[DetectedSpeaker] = Field(
         default_factory=list,
         description="List of detected speakers and any names inferred from introductions or dialog.",
@@ -182,39 +190,47 @@ class MeetingMinutesReport(BaseModel):
     executive_summary: str = Field(description="Executive summary of the meeting in English.")
     agenda_and_decisions: list[AgendaItem] = Field(description="Topic breakdowns and decisions in English.")
     action_items: list[ActionItem] = Field(description="Action items extracted in English.")
+    next_meeting_date: str = Field(default="TBD", description="Date of the next meeting if agreed.")
+    next_meeting_time: str = Field(default="TBD", description="Time of next meeting if agreed.")
+    next_meeting_agenda_focus: str = Field(default="", description="Agenda focus of upcoming meeting.")
+    closing_remarks: str = Field(default="The meeting was concluded.", description="Meeting closing statement.")
     transcript: list[TranscriptEntry] = Field(description="Bilingual speaker-diarized transcript.")
 
 
-# AI Template Transformation Schemas
-class ParagraphInstruction(BaseModel):
-    element_id: str = Field(description="The p_index identifier (e.g., 'p_3').")
+# AI Universal Template Schemas
+class UniversalParagraphPlan(BaseModel):
+    element_id: str = Field(description="Paragraph id, e.g., 'p_3'.")
     action: str = Field(
-        description="One of: 'KEEP_STATIC' (headers, titles, corporate labels), 'REPLACE' (substitute sample value with Jinja tag), 'PURGE' (delete dummy sample text entirely)."
+        description="'KEEP_STATIC' (section headers, logos, labels), 'REPLACE' (substitute sample value with tag), or 'PURGE' (delete dummy content)."
     )
-    jinja_tag: str = Field(
+    replacement_jinja_tag: str = Field(
         default="",
-        description="Exact Jinja2 placeholder if action is 'REPLACE'. E.g. '{{ executive_summary }}', 'Date: {{ date }}', 'Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}'",
+        description="Exact Jinja placeholder if action is REPLACE, preserving static prefixes (e.g., 'Date: {{ date }}' or '{{ executive_summary }}').",
     )
 
 
-class TableInstruction(BaseModel):
-    table_id: str = Field(description="The table_index identifier (e.g., 't_0').")
+class UniversalTablePlan(BaseModel):
+    table_id: str = Field(description="Coordinate id of table, e.g., 't_0'.")
+    table_purpose: str = Field(
+        description="Semantic purpose identified, e.g., 'attendees_roster', 'action_items', 'metadata_kv', 'agenda_grid'."
+    )
     action: str = Field(
-        description="One of: 'KEEP_STATIC', 'ACTION_ITEMS_LOOP', 'AGENDA_LOOP', 'IGNORE'."
+        description="'TRANSFORM_LOOP' to turn into repeating rows, 'KEEP_STATIC' for static layout/signatures, or 'PURGE' to delete."
     )
-    cell_tag_map: list[str] = Field(
+    header_rows_count: int = Field(default=1, description="Number of header rows to preserve untouched at top.")
+    loop_target_entity: str = Field(
+        default="",
+        description="Collection to iterate over: 'attendees', 'action_items', 'agenda_and_decisions', or 'transcript'.",
+    )
+    cell_jinja_expressions: list[str] = Field(
         default_factory=list,
-        description="Jinja expressions to populate across the newly injected row's cells (e.g. ['{%tr for item in action_items %}{{ item.task }}', '{{ item.owner }}', '{{ item.deadline }}', '{{ item.priority }}{%tr endfor %}']).",
+        description="Jinja expressions across each cell of the generated loop row. Example: ['{%tr for a in attendees %}{{ loop.index }}', '{{ a.name }}', '{{ a.designation }}{%tr endfor %}']",
     )
 
 
-class TemplateTransformationPlan(BaseModel):
-    paragraph_instructions: list[ParagraphInstruction] = Field(
-        description="Specific instructions for each paragraph node."
-    )
-    table_instructions: list[TableInstruction] = Field(
-        description="Specific instructions for each table node."
-    )
+class UniversalTemplatePlan(BaseModel):
+    paragraphs: list[UniversalParagraphPlan]
+    tables: list[UniversalTablePlan]
 
 
 # -----------------------------------------------------------------------------
@@ -274,7 +290,6 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
 
 
 def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str) -> str:
-    """Executes a synchronous LLM call requesting structured JSON output."""
     cleaned_base = endpoint_base.rstrip("/")
     is_gemini = "googleapis.com" in cleaned_base
 
@@ -295,7 +310,7 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
             "temperature": 0.1,
         }
 
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=90.0) as client:
         res = client.post(url, headers=headers, json=payload)
 
     if res.status_code != 200:
@@ -320,10 +335,9 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
 
 
 # -----------------------------------------------------------------------------
-# AI-Assisted Sample Document Deconstruction & Template Pipeline
+# Universal Semantic Template Generation Pipeline
 # -----------------------------------------------------------------------------
 def build_document_skeleton(doc: Document) -> dict:
-    """Step 1 (Deterministic Extraction): Maps Word XML into indexed coordinate structures."""
     paragraphs_meta = []
     for idx, p in enumerate(doc.paragraphs):
         full_text = "".join(r.text for r in p.runs).strip()
@@ -338,14 +352,15 @@ def build_document_skeleton(doc: Document) -> dict:
 
     tables_meta = []
     for t_idx, table in enumerate(doc.tables):
-        headers = [c.text.strip() for c in table.rows[0].cells] if len(table.rows) > 0 else []
-        sample_row = [c.text.strip() for c in table.rows[1].cells] if len(table.rows) > 1 else []
+        rows_sample = []
+        for row in table.rows[:4]:
+            rows_sample.append([cell.text.strip() for cell in row.cells])
+
         tables_meta.append({
             "id": f"t_{t_idx}",
             "cols_count": len(table.columns),
             "total_rows": len(table.rows),
-            "headers": headers,
-            "first_sample_row": sample_row,
+            "rows_preview": rows_sample,
         })
 
     return {"paragraphs": paragraphs_meta, "tables": tables_meta}
@@ -358,49 +373,66 @@ def generate_template_from_sample_ai(
     model_name: str,
     status_container=None,
 ) -> io.BytesIO:
-    """AI-powered multi-stage structural deconstruction and Jinja2 synthesis engine."""
     doc = Document(io.BytesIO(sample_bytes))
 
     if status_container:
-        status_container.info("Step 1/3: Extracting document node skeleton...")
+        status_container.info("Step 1/3: Extracting structural document coordinate skeleton...")
     skeleton = build_document_skeleton(doc)
 
-    prompt = (
-        "You are an expert document template architect. We are converting a finished meeting minutes Word document "
-        "into a reusable Jinja2 template for python-docx / docxtpl.\n\n"
-        "Here is the structural node skeleton of the document:\n"
-        f"{json.dumps(skeleton, indent=2)}\n\n"
-        "Available context variables in downstream rendering:\n"
-        "- title: str\n"
-        "- date: str\n"
-        "- attendees: list[str]\n"
-        "- executive_summary: str\n"
-        "- agenda_and_decisions: list[{topic: str, discussion_summary: str, decisions_made: list[str]}]\n"
-        "- action_items: list[{task: str, owner: str, deadline: str, priority: str}]\n"
-        "- transcript: list[{speaker: str, timestamp: str, translated_text: str}]\n\n"
-        "Instructions:\n"
-        "1. For paragraphs: Determine which lines are STATIC headers/labels (KEEP_STATIC), which are single-line dynamic "
-        "fields to REPLACE (e.g. 'Date: {{ date }}', '{{ title }}', '{{ executive_summary }}', 'Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}'), "
-        "and which lines are residual dummy sample text that MUST BE DELETED (PURGE).\n"
-        "2. For tables: If it's an Action Items grid, action = 'ACTION_ITEMS_LOOP' and provide cell_tag_map using docxtpl row repetition syntax "
-        "like ['{%tr for item in action_items %}{{ item.task }}', '{{ item.owner }}', '{{ item.deadline }}', '{{ item.priority }}{%tr endfor %}']. "
-        "If it's an Agenda table, action = 'AGENDA_LOOP'. Otherwise 'KEEP_STATIC' or 'IGNORE'.\n\n"
-        "Return pure valid JSON matching this schema:\n"
-        + json.dumps(TemplateTransformationPlan.model_json_schema())
-    )
+    prompt = f"""
+You are an expert Word OpenXML and docxtpl template architect.
+Transform the following real-world meeting document skeleton into a clean, reusable Jinja2 template.
+
+DOCUMENT SKELETON:
+{json.dumps(skeleton, indent=2)}
+
+AVAILABLE DATA CONTEXT FOR RENDERING:
+- title: str
+- date: str
+- meeting_time: str
+- minute_taker: str
+- attendees: list[{{name: str, designation: str}}]
+- executive_summary: str
+- agenda_and_decisions: list[{{topic: str, discussion_summary: str, decisions_made: list[str]}}]
+- action_items: list[{{task: str, owner: str, department: str, deadline: str, priority: str}}]
+- next_meeting_date: str
+- next_meeting_time: str
+- next_meeting_agenda_focus: str
+- closing_remarks: str
+- transcript: list[{{speaker: str, timestamp: str, translated_text: str}}]
+
+UNIVERSAL DECONSTRUCTION RULES:
+1. Tables:
+   - If a table lists attendees/participants (Sr#, Name, Designation):
+     action = 'TRANSFORM_LOOP', header_rows_count = 1, loop_target_entity = 'attendees'.
+     cell_jinja_expressions must map columns accurately, e.g.:
+     ['{{%tr for a in attendees %}}{{{{ loop.index }}}}', '{{{{ a.name }}}}', '{{{{ a.designation }}}}{{%tr endfor %}}']
+   - If a table contains action items, agenda points, or tasks:
+     action = 'TRANSFORM_LOOP', header_rows_count = 1, loop_target_entity = 'action_items'.
+     cell_jinja_expressions must match table column count, e.g.:
+     ['{{%tr for item in action_items %}}{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.priority }}}}{{%tr endfor %}}']
+   - Tables with key-value pairs or signatures: action = 'KEEP_STATIC'.
+2. Paragraphs:
+   - Section headers (e.g. 'ATTENDEES', 'Agenda Points:', '3. NEXT MEETING', '4. CLOSING'): action = 'KEEP_STATIC'.
+   - Static labels with values to replace: action = 'REPLACE'. Preserve the label prefix:
+     e.g., 'Meeting Title: {{{{ title }}}}', 'Date: {{{{ date }}}}', 'Time: {{{{ meeting_time }}}}', 'Minute Taker: {{{{ minute_taker }}}}'.
+   - Dummy narrative paragraphs (old summaries, past tasks, specific discussion notes from the past): action = 'PURGE'.
+
+Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema.
+"""
 
     if status_container:
-        status_container.info("Step 2/3: AI synthesizing layout, static headers & Jinja2 loops...")
+        status_container.info("Step 2/3: AI synthesizing universal layout mapping & Jinja2 loops...")
 
     raw_plan_json = call_llm_json(base_url, api_key, model_name, prompt)
     plan_dict = json.loads(raw_plan_json)
-    plan = TemplateTransformationPlan(**plan_dict)
+    plan = UniversalTemplatePlan(**plan_dict)
 
     if status_container:
         status_container.info("Step 3/3: Deterministically executing XML node mutations...")
 
-    p_instructions = {item.element_id: item for item in plan.paragraph_instructions}
-    t_instructions = {item.table_id: item for item in plan.table_instructions}
+    p_instructions = {item.element_id: item for item in plan.paragraphs}
+    t_instructions = {item.table_id: item for item in plan.tables}
 
     # Execute Paragraph Mutations
     paragraphs_to_remove = []
@@ -410,14 +442,13 @@ def generate_template_from_sample_ai(
             instr = p_instructions[p_id]
             if instr.action == "PURGE":
                 paragraphs_to_remove.append(p)
-            elif instr.action == "REPLACE" and instr.jinja_tag:
-                # Preserve paragraph formatting: clear trailing runs and set run 0 text
+            elif instr.action == "REPLACE" and instr.replacement_jinja_tag:
                 if p.runs:
-                    p.runs[0].text = instr.jinja_tag
+                    p.runs[0].text = instr.replacement_jinja_tag
                     for r in p.runs[1:]:
                         r.text = ""
                 else:
-                    p.add_run(instr.jinja_tag)
+                    p.add_run(instr.replacement_jinja_tag)
 
     for p in paragraphs_to_remove:
         p_element = p._p
@@ -428,18 +459,24 @@ def generate_template_from_sample_ai(
     for t_idx, table in enumerate(doc.tables):
         t_id = f"t_{t_idx}"
         if t_id in t_instructions:
-            t_instr = t_instructions[t_id]
-            if t_instr.action in ["ACTION_ITEMS_LOOP", "AGENDA_LOOP"] and t_instr.cell_tag_map:
-                # Purge all sample data rows; keep header row
-                while len(table.rows) > 1:
+            plan_t = t_instructions[t_id]
+            if plan_t.action == "TRANSFORM_LOOP" and plan_t.cell_jinja_expressions:
+                # Purge all sample data rows while preserving headers
+                while len(table.rows) > plan_t.header_rows_count:
                     row = table.rows[-1]
                     tr = row._tr
                     tr.getparent().remove(tr)
 
+                # Inject dynamic Jinja loop row
                 new_row = table.add_row()
                 for c_idx, cell in enumerate(new_row.cells):
-                    if c_idx < len(t_instr.cell_tag_map):
-                        cell.text = t_instr.cell_tag_map[c_idx]
+                    if c_idx < len(plan_t.cell_jinja_expressions):
+                        cell.text = plan_t.cell_jinja_expressions[c_idx]
+
+            elif plan_t.action == "PURGE":
+                tbl = table._tbl
+                if tbl.getparent() is not None:
+                    tbl.getparent().remove(tbl)
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -450,8 +487,19 @@ def generate_template_from_sample_ai(
 def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
+
+    # Normalization ensuring compatibility with both object models and string templates
+    normalized_attendees = []
+    for a in context.get("attendees", []):
+        if isinstance(a, dict):
+            normalized_attendees.append(a)
+        else:
+            normalized_attendees.append({"name": str(a), "designation": ""})
+    context["attendees"] = normalized_attendees
+
     for item in context.get("transcript", []):
         item["text"] = item.get("translated_text") or item.get("original_text", "")
+
     doc.render(context)
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -463,38 +511,59 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
     doc = Document()
     doc.add_heading(data.title, level=0)
     doc.add_paragraph(f"Date: {data.date}")
-    doc.add_paragraph(f"Attendees: {', '.join(data.attendees) if data.attendees else 'Not specified'}")
+    if data.meeting_time:
+        doc.add_paragraph(f"Time: {data.meeting_time}")
+    if data.minute_taker:
+        doc.add_paragraph(f"Minute Taker: {data.minute_taker}")
 
-    doc.add_heading("1. Executive Summary", level=1)
+    doc.add_heading("1. Attendees", level=1)
+    if data.attendees:
+        tbl = doc.add_table(rows=1, cols=3)
+        tbl.style = "Table Grid"
+        h = tbl.rows[0].cells
+        h[0].text = "Sr.#"
+        h[1].text = "Name"
+        h[2].text = "Designation"
+        for i, a in enumerate(data.attendees, 1):
+            r = tbl.add_row().cells
+            r[0].text = str(i)
+            r[1].text = a.name
+            r[2].text = a.designation
+    else:
+        doc.add_paragraph("No attendees specified.")
+
+    doc.add_heading("2. Executive Summary", level=1)
     doc.add_paragraph(data.executive_summary)
 
-    doc.add_heading("2. Agenda Items & Decisions", level=1)
+    doc.add_heading("3. Agenda Items & Decisions", level=1)
     for idx, item in enumerate(data.agenda_and_decisions, 1):
-        doc.add_heading(f"2.{idx} {item.topic}", level=2)
+        doc.add_heading(f"3.{idx} {item.topic}", level=2)
         doc.add_paragraph(f"Summary: {item.discussion_summary}")
         if item.decisions_made:
             doc.add_paragraph("Decisions Reached:", style="List Bullet")
             for dec in item.decisions_made:
                 doc.add_paragraph(dec, style="List Bullet 2")
 
-    doc.add_heading("3. Action Items", level=1)
+    doc.add_heading("4. Action Items", level=1)
     if data.action_items:
-        table = doc.add_table(rows=1, cols=4)
+        table = doc.add_table(rows=1, cols=5)
         table.style = "Table Grid"
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Task"
-        hdr_cells[1].text = "Owner"
-        hdr_cells[2].text = "Deadline"
-        hdr_cells[3].text = "Priority"
+        hdr = table.rows[0].cells
+        hdr[0].text = "Task"
+        hdr[1].text = "Owner"
+        hdr[2].text = "Department"
+        hdr[3].text = "Deadline"
+        hdr[4].text = "Priority"
 
         for ai in data.action_items:
             row_cells = table.add_row().cells
             row_cells[0].text = ai.task
             row_cells[1].text = ai.owner
-            row_cells[2].text = ai.deadline
-            row_cells[3].text = ai.priority
+            row_cells[2].text = ai.department
+            row_cells[3].text = ai.deadline
+            row_cells[4].text = ai.priority
 
-    doc.add_heading("4. Speaker-Diarized Transcript (English)", level=1)
+    doc.add_heading("5. Speaker-Diarized Transcript (English)", level=1)
     for entry in data.transcript:
         ts = f"[{entry.timestamp}] " if entry.timestamp else ""
         p = doc.add_paragraph()
@@ -541,13 +610,15 @@ def analyze_meeting_audio_rest(
 
     prompt = (
         "You are an expert executive meeting assistant. Listen carefully to this meeting audio recording:\n"
-        "1. Produce a full diarized transcript identifying distinct speakers (e.g., Speaker 1, Speaker 2).\n"
-        "2. In the transcript, transcribe the speech verbatim in 'original_text' (preserving native language/words), "
-        "and provide an accurate English translation in 'translated_text' (keep identical if already English).\n"
-        "3. Listen for verbal introductions, greetings, or names addressed in conversation to infer the real name of each speaker in 'detected_speakers'.\n"
-        "4. Generate a comprehensive English executive summary.\n"
-        "5. List all topics and decisions made in English.\n"
-        "6. Extract all action items with owners, deadlines, and priorities in English.\n"
+        "1. Identify attendees with their designations/roles if mentioned in 'attendees'.\n"
+        "2. Produce a full diarized transcript identifying distinct speakers.\n"
+        "3. Transcribe speech verbatim in 'original_text' (preserving native language/words), "
+        "and provide an accurate English translation in 'translated_text'.\n"
+        "4. Listen for verbal introductions, greetings, or names addressed in conversation to infer the real name of each speaker in 'detected_speakers'.\n"
+        "5. Generate a comprehensive English executive summary.\n"
+        "6. List all topics and decisions made in English.\n"
+        "7. Extract all action items with owners, departments, deadlines, and priorities/remarks in English.\n"
+        "8. Extract any next meeting logistics (date, time, agenda focus) and closing remarks.\n"
         "Return the output as pure valid JSON conforming strictly to this structure:\n"
         + json.dumps(MeetingMinutesReport.model_json_schema())
     )
@@ -733,19 +804,12 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
             if new_spk.strip() and old_spk.lower() in ai.owner.lower():
                 ai.owner = ai.owner.replace(old_spk, new_spk.strip())
 
-    new_attendees = set()
-    for att in updated.attendees:
-        replaced = att
-        for old_spk, new_spk in name_map.items():
-            if new_spk.strip() and old_spk.lower() in att.lower():
-                replaced = new_spk.strip()
-        new_attendees.add(replaced)
+    existing_attendee_names = {a.name for a in updated.attendees}
+    for old_spk, new_spk in name_map.items():
+        if new_spk.strip() and new_spk.strip() not in existing_attendee_names:
+            updated.attendees.append(Attendee(name=new_spk.strip(), designation="Participant"))
+            existing_attendee_names.add(new_spk.strip())
 
-    for new_spk in name_map.values():
-        if new_spk.strip():
-            new_attendees.add(new_spk.strip())
-
-    updated.attendees = sorted(list(new_attendees))
     return updated
 
 
@@ -818,7 +882,7 @@ def main():
     col_left, col_right = st.columns([0.40, 0.60], gap="large")
 
     # =========================================================================
-    # LEFT PANEL: Sequenced Workflow (1, 2, 3) + Execution Console
+    # LEFT PANEL: Workflow Steps + Console
     # =========================================================================
     with col_left:
         st.markdown("#### 1. Upload Audio")
@@ -852,7 +916,7 @@ def main():
             sample_file = st.file_uploader("Upload Finished Sample (.docx)", type=["docx"], key="sample_docx")
             if sample_file:
                 tpl_status = st.empty()
-                if st.button("🤖 Build AI Template from Sample", use_container_width=True):
+                if st.button("🤖 Build Universal AI Template from Sample", use_container_width=True):
                     active_key = st.session_state.get("api_key")
                     active_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
                     active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
@@ -871,7 +935,7 @@ def main():
                             converted_bytes = converted_io.getvalue()
                             st.session_state["active_template_bytes"] = converted_bytes
                             st.session_state["converted_template_download"] = converted_bytes
-                            tpl_status.success("AI template successfully synthesized! All dummy text purged.")
+                            tpl_status.success("Universal template generated! All dummy rows & past text excised.")
                         except Exception as err:
                             tpl_status.error(f"AI conversion error: {err}")
 
@@ -988,10 +1052,11 @@ def main():
                 |                    MEETING DOCUMENT VIEWER                  |
                 |                                                             |
                 |  • Executive Summary (English)                              |
+                |  • Attendee Rosters (Names & Designations)                  |
                 |  • Diarized Speaker Verification & Re-mapping               |
                 |  • Bilingual Transcript (Original Spoken + Translated)      |
-                |  • Action Items Matrix (Owner, Deadline, Priority)          |
-                |  • Dynamic DOCX Generation & Export                         |
+                |  • Action Items Matrix (Owner, Department, Due, Remarks)    |
+                |  • Universal DOCX Generation & Export                       |
                 +-------------------------------------------------------------+
                 ```
                 """
@@ -1003,7 +1068,8 @@ def main():
             t_col1, t_col2 = st.columns([0.7, 0.3])
             with t_col1:
                 st.markdown(f"## {result.title}")
-                st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(result.attendees)}")
+                attendee_names = [a.name for a in result.attendees]
+                st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(attendee_names)}")
             with t_col2:
                 if active_template:
                     try:
@@ -1050,8 +1116,8 @@ def main():
                         st.rerun()
 
             # Structured Deliverables
-            tab_overview, tab_actions, tab_transcript, tab_raw = st.tabs(
-                ["📄 Overview & Agendas", "✅ Action Items", "📝 Diarized Transcript", "🔧 Raw Data"]
+            tab_overview, tab_actions, tab_attendees, tab_transcript, tab_raw = st.tabs(
+                ["📄 Overview & Agendas", "✅ Action Items", "👥 Attendees", "📝 Diarized Transcript", "🔧 Raw Data"]
             )
 
             with tab_overview:
@@ -1068,12 +1134,26 @@ def main():
                             for dec in item.decisions_made:
                                 st.markdown(f"- {dec}")
 
+                if result.next_meeting_date != "TBD" or result.next_meeting_agenda_focus:
+                    st.markdown("---")
+                    st.markdown("### Next Meeting Logistics")
+                    st.write(f"**Date:** {result.next_meeting_date} | **Time:** {result.next_meeting_time}")
+                    if result.next_meeting_agenda_focus:
+                        st.write(f"**Agenda Focus:** {result.next_meeting_agenda_focus}")
+
             with tab_actions:
                 st.markdown("### Action Items Matrix")
                 if result.action_items:
                     st.dataframe([item.model_dump() for item in result.action_items], use_container_width=True)
                 else:
                     st.info("No action items detected in the discussion.")
+
+            with tab_attendees:
+                st.markdown("### Attendee Roster")
+                if result.attendees:
+                    st.dataframe([a.model_dump() for a in result.attendees], use_container_width=True)
+                else:
+                    st.info("No attendees recorded.")
 
             with tab_transcript:
                 view_mode = st.radio(
