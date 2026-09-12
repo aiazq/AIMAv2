@@ -53,7 +53,7 @@ st.markdown(
         border: 1px solid rgba(128, 128, 128, 0.15);
     }
 
-    /* Terminal Console Box */
+    /* Terminal Console Box with Native Auto-Scroll */
     .terminal-container {
         font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
         font-size: 0.82rem;
@@ -66,6 +66,8 @@ st.markdown(
         border: 1px solid #1f2937;
         line-height: 1.45;
         white-space: pre-wrap;
+        display: flex;
+        flex-direction: column-reverse;
     }
 
     .log-quip {
@@ -119,12 +121,9 @@ if "logs_list" not in st.session_state:
 if "usage_stats" not in st.session_state:
     st.session_state["usage_stats"] = None
 
-if "is_processing" not in st.session_state:
-    st.session_state["is_processing"] = False
-
 
 # -----------------------------------------------------------------------------
-# Quips Collection
+# Corporate Quips
 # -----------------------------------------------------------------------------
 FUNNY_QUIPS = [
     "Translating 'per my last email' into diplomatic corporate prose...",
@@ -145,7 +144,7 @@ FUNNY_QUIPS = [
 
 
 # -----------------------------------------------------------------------------
-# Pydantic Schemas (Bilingual Transcription Supported)
+# Pydantic Schemas
 # -----------------------------------------------------------------------------
 class ActionItem(BaseModel):
     task: str = Field(description="Description of the action item or task.")
@@ -186,8 +185,40 @@ class MeetingMinutesReport(BaseModel):
     transcript: list[TranscriptEntry] = Field(description="Bilingual speaker-diarized transcript.")
 
 
+# AI Template Transformation Schemas
+class ParagraphInstruction(BaseModel):
+    element_id: str = Field(description="The p_index identifier (e.g., 'p_3').")
+    action: str = Field(
+        description="One of: 'KEEP_STATIC' (headers, titles, corporate labels), 'REPLACE' (substitute sample value with Jinja tag), 'PURGE' (delete dummy sample text entirely)."
+    )
+    jinja_tag: str = Field(
+        default="",
+        description="Exact Jinja2 placeholder if action is 'REPLACE'. E.g. '{{ executive_summary }}', 'Date: {{ date }}', 'Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}'",
+    )
+
+
+class TableInstruction(BaseModel):
+    table_id: str = Field(description="The table_index identifier (e.g., 't_0').")
+    action: str = Field(
+        description="One of: 'KEEP_STATIC', 'ACTION_ITEMS_LOOP', 'AGENDA_LOOP', 'IGNORE'."
+    )
+    cell_tag_map: list[str] = Field(
+        default_factory=list,
+        description="Jinja expressions to populate across the newly injected row's cells (e.g. ['{%tr for item in action_items %}{{ item.task }}', '{{ item.owner }}', '{{ item.deadline }}', '{{ item.priority }}{%tr endfor %}']).",
+    )
+
+
+class TemplateTransformationPlan(BaseModel):
+    paragraph_instructions: list[ParagraphInstruction] = Field(
+        description="Specific instructions for each paragraph node."
+    )
+    table_instructions: list[TableInstruction] = Field(
+        description="Specific instructions for each table node."
+    )
+
+
 # -----------------------------------------------------------------------------
-# Real-time Auto-Scrolling Logger
+# Logger
 # -----------------------------------------------------------------------------
 def log_event(log_container, logs_list, message: str, level: str = "INFO"):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -206,24 +237,13 @@ def log_event(log_container, logs_list, message: str, level: str = "INFO"):
         entry = f'<span>[{ts}] <span class="{level_css}">[{level}]</span> {message}</span>'
 
     logs_list.append(entry)
-
-    # HTML with embedded JavaScript for auto-scroll
-    html_output = f"""
-    <div id="aima-terminal-box" class="terminal-container">
-        {"<br>".join(logs_list)}
-    </div>
-    <script>
-        var terminal = document.getElementById('aima-terminal-box');
-        if (terminal) {{
-            terminal.scrollTop = terminal.scrollHeight;
-        }}
-    </script>
-    """
+    reversed_items = "<br>".join(reversed(logs_list))
+    html_output = f'<div id="aima-terminal-box" class="terminal-container">{reversed_items}</div>'
     log_container.markdown(html_output, unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
-# Model Discovery & Inference
+# Model Discovery & Inference Helpers
 # -----------------------------------------------------------------------------
 def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     cleaned_base = base_url.rstrip("/")
@@ -253,6 +273,244 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     return [DEFAULT_MODEL]
 
 
+def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str) -> str:
+    """Executes a synchronous LLM call requesting structured JSON output."""
+    cleaned_base = endpoint_base.rstrip("/")
+    is_gemini = "googleapis.com" in cleaned_base
+
+    if is_gemini:
+        url = f"{cleaned_base}/models/{model_name}:generateContent"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1},
+        }
+    else:
+        url = f"{cleaned_base}/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+        }
+
+    with httpx.Client(timeout=60.0) as client:
+        res = client.post(url, headers=headers, json=payload)
+
+    if res.status_code != 200:
+        raise RuntimeError(f"HTTP {res.status_code} from provider: {res.text}")
+
+    res_json = res.json()
+    if "candidates" in res_json:
+        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+    elif "choices" in res_json:
+        raw_text = res_json["choices"][0]["message"]["content"]
+    else:
+        raw_text = json.dumps(res_json)
+
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+# -----------------------------------------------------------------------------
+# AI-Assisted Sample Document Deconstruction & Template Pipeline
+# -----------------------------------------------------------------------------
+def build_document_skeleton(doc: Document) -> dict:
+    """Step 1 (Deterministic Extraction): Maps Word XML into indexed coordinate structures."""
+    paragraphs_meta = []
+    for idx, p in enumerate(doc.paragraphs):
+        full_text = "".join(r.text for r in p.runs).strip()
+        if not full_text:
+            continue
+        paragraphs_meta.append({
+            "id": f"p_{idx}",
+            "text": full_text,
+            "style": p.style.name if p.style else "Normal",
+            "is_bold": any(r.bold for r in p.runs if r.text.strip()),
+        })
+
+    tables_meta = []
+    for t_idx, table in enumerate(doc.tables):
+        headers = [c.text.strip() for c in table.rows[0].cells] if len(table.rows) > 0 else []
+        sample_row = [c.text.strip() for c in table.rows[1].cells] if len(table.rows) > 1 else []
+        tables_meta.append({
+            "id": f"t_{t_idx}",
+            "cols_count": len(table.columns),
+            "total_rows": len(table.rows),
+            "headers": headers,
+            "first_sample_row": sample_row,
+        })
+
+    return {"paragraphs": paragraphs_meta, "tables": tables_meta}
+
+
+def generate_template_from_sample_ai(
+    sample_bytes: bytes,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    status_container=None,
+) -> io.BytesIO:
+    """AI-powered multi-stage structural deconstruction and Jinja2 synthesis engine."""
+    doc = Document(io.BytesIO(sample_bytes))
+
+    if status_container:
+        status_container.info("Step 1/3: Extracting document node skeleton...")
+    skeleton = build_document_skeleton(doc)
+
+    prompt = (
+        "You are an expert document template architect. We are converting a finished meeting minutes Word document "
+        "into a reusable Jinja2 template for python-docx / docxtpl.\n\n"
+        "Here is the structural node skeleton of the document:\n"
+        f"{json.dumps(skeleton, indent=2)}\n\n"
+        "Available context variables in downstream rendering:\n"
+        "- title: str\n"
+        "- date: str\n"
+        "- attendees: list[str]\n"
+        "- executive_summary: str\n"
+        "- agenda_and_decisions: list[{topic: str, discussion_summary: str, decisions_made: list[str]}]\n"
+        "- action_items: list[{task: str, owner: str, deadline: str, priority: str}]\n"
+        "- transcript: list[{speaker: str, timestamp: str, translated_text: str}]\n\n"
+        "Instructions:\n"
+        "1. For paragraphs: Determine which lines are STATIC headers/labels (KEEP_STATIC), which are single-line dynamic "
+        "fields to REPLACE (e.g. 'Date: {{ date }}', '{{ title }}', '{{ executive_summary }}', 'Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}'), "
+        "and which lines are residual dummy sample text that MUST BE DELETED (PURGE).\n"
+        "2. For tables: If it's an Action Items grid, action = 'ACTION_ITEMS_LOOP' and provide cell_tag_map using docxtpl row repetition syntax "
+        "like ['{%tr for item in action_items %}{{ item.task }}', '{{ item.owner }}', '{{ item.deadline }}', '{{ item.priority }}{%tr endfor %}']. "
+        "If it's an Agenda table, action = 'AGENDA_LOOP'. Otherwise 'KEEP_STATIC' or 'IGNORE'.\n\n"
+        "Return pure valid JSON matching this schema:\n"
+        + json.dumps(TemplateTransformationPlan.model_json_schema())
+    )
+
+    if status_container:
+        status_container.info("Step 2/3: AI synthesizing layout, static headers & Jinja2 loops...")
+
+    raw_plan_json = call_llm_json(base_url, api_key, model_name, prompt)
+    plan_dict = json.loads(raw_plan_json)
+    plan = TemplateTransformationPlan(**plan_dict)
+
+    if status_container:
+        status_container.info("Step 3/3: Deterministically executing XML node mutations...")
+
+    p_instructions = {item.element_id: item for item in plan.paragraph_instructions}
+    t_instructions = {item.table_id: item for item in plan.table_instructions}
+
+    # Execute Paragraph Mutations
+    paragraphs_to_remove = []
+    for idx, p in enumerate(doc.paragraphs):
+        p_id = f"p_{idx}"
+        if p_id in p_instructions:
+            instr = p_instructions[p_id]
+            if instr.action == "PURGE":
+                paragraphs_to_remove.append(p)
+            elif instr.action == "REPLACE" and instr.jinja_tag:
+                # Preserve paragraph formatting: clear trailing runs and set run 0 text
+                if p.runs:
+                    p.runs[0].text = instr.jinja_tag
+                    for r in p.runs[1:]:
+                        r.text = ""
+                else:
+                    p.add_run(instr.jinja_tag)
+
+    for p in paragraphs_to_remove:
+        p_element = p._p
+        if p_element.getparent() is not None:
+            p_element.getparent().remove(p_element)
+
+    # Execute Table Mutations
+    for t_idx, table in enumerate(doc.tables):
+        t_id = f"t_{t_idx}"
+        if t_id in t_instructions:
+            t_instr = t_instructions[t_id]
+            if t_instr.action in ["ACTION_ITEMS_LOOP", "AGENDA_LOOP"] and t_instr.cell_tag_map:
+                # Purge all sample data rows; keep header row
+                while len(table.rows) > 1:
+                    row = table.rows[-1]
+                    tr = row._tr
+                    tr.getparent().remove(tr)
+
+                new_row = table.add_row()
+                for c_idx, cell in enumerate(new_row.cells):
+                    if c_idx < len(t_instr.cell_tag_map):
+                        cell.text = t_instr.cell_tag_map[c_idx]
+
+    out_stream = io.BytesIO()
+    doc.save(out_stream)
+    out_stream.seek(0)
+    return out_stream
+
+
+def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
+    doc = DocxTemplate(io.BytesIO(template_bytes))
+    context = data.model_dump()
+    for item in context.get("transcript", []):
+        item["text"] = item.get("translated_text") or item.get("original_text", "")
+    doc.render(context)
+    out_stream = io.BytesIO()
+    doc.save(out_stream)
+    out_stream.seek(0)
+    return out_stream
+
+
+def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
+    doc = Document()
+    doc.add_heading(data.title, level=0)
+    doc.add_paragraph(f"Date: {data.date}")
+    doc.add_paragraph(f"Attendees: {', '.join(data.attendees) if data.attendees else 'Not specified'}")
+
+    doc.add_heading("1. Executive Summary", level=1)
+    doc.add_paragraph(data.executive_summary)
+
+    doc.add_heading("2. Agenda Items & Decisions", level=1)
+    for idx, item in enumerate(data.agenda_and_decisions, 1):
+        doc.add_heading(f"2.{idx} {item.topic}", level=2)
+        doc.add_paragraph(f"Summary: {item.discussion_summary}")
+        if item.decisions_made:
+            doc.add_paragraph("Decisions Reached:", style="List Bullet")
+            for dec in item.decisions_made:
+                doc.add_paragraph(dec, style="List Bullet 2")
+
+    doc.add_heading("3. Action Items", level=1)
+    if data.action_items:
+        table = doc.add_table(rows=1, cols=4)
+        table.style = "Table Grid"
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Task"
+        hdr_cells[1].text = "Owner"
+        hdr_cells[2].text = "Deadline"
+        hdr_cells[3].text = "Priority"
+
+        for ai in data.action_items:
+            row_cells = table.add_row().cells
+            row_cells[0].text = ai.task
+            row_cells[1].text = ai.owner
+            row_cells[2].text = ai.deadline
+            row_cells[3].text = ai.priority
+
+    doc.add_heading("4. Speaker-Diarized Transcript (English)", level=1)
+    for entry in data.transcript:
+        ts = f"[{entry.timestamp}] " if entry.timestamp else ""
+        p = doc.add_paragraph()
+        runner = p.add_run(f"{ts}{entry.speaker}: ")
+        runner.bold = True
+        p.add_run(entry.translated_text)
+
+    out_stream = io.BytesIO()
+    doc.save(out_stream)
+    out_stream.seek(0)
+    return out_stream
+
+
+# -----------------------------------------------------------------------------
+# Audio Pipeline Dispatcher
+# -----------------------------------------------------------------------------
 def dispatch_http_request(endpoint_url: str, headers: dict, payload: dict) -> httpx.Response:
     with httpx.Client(timeout=360.0) as client:
         return client.post(endpoint_url, headers=headers, json=payload)
@@ -463,9 +721,6 @@ def analyze_meeting_audio_rest(
     return report, stats
 
 
-# -----------------------------------------------------------------------------
-# Speaker Replacement Routine
-# -----------------------------------------------------------------------------
 def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str, str]) -> MeetingMinutesReport:
     updated = report.model_copy(deep=True)
 
@@ -495,135 +750,6 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
 
 
 # -----------------------------------------------------------------------------
-# Template Creation & Population Engine
-# -----------------------------------------------------------------------------
-def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
-    doc = Document(io.BytesIO(sample_bytes))
-
-    def replace_keywords_in_paragraph(p):
-        full_text = "".join(r.text for r in p.runs).strip()
-        if not full_text:
-            return
-        low = full_text.lower()
-
-        matched = False
-        target_tag = ""
-
-        if any(w in low for w in ["executive summary", "overview", "background", "summary:"]):
-            target_tag = "{{ executive_summary }}"
-            matched = True
-        elif any(w in low for w in ["attendees", "participants", "present:"]):
-            target_tag = "Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}"
-            matched = True
-        elif any(w in low for w in ["meeting date", "date:"]):
-            target_tag = "Date: {{ date }}"
-            matched = True
-        elif any(w in low for w in ["meeting title", "subject:", "title:"]):
-            target_tag = "{{ title }}"
-            matched = True
-
-        if matched:
-            for r in p.runs:
-                r.text = ""
-            p.runs[0].text = target_tag
-
-    for p in doc.paragraphs:
-        replace_keywords_in_paragraph(p)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    replace_keywords_in_paragraph(p)
-
-        if len(table.rows) >= 2:
-            first_row_txt = " ".join(c.text.lower() for c in table.rows[0].cells)
-            if any(w in first_row_txt for w in ["task", "action", "owner", "assignee", "due", "priority"]):
-                while len(table.rows) > 1:
-                    row_to_delete = table.rows[-1]
-                    tr = row_to_delete._tr
-                    tr.getparent().remove(tr)
-
-                new_row = table.add_row()
-                cells = new_row.cells
-                if len(cells) >= 4:
-                    cells[0].text = "{%tr for item in action_items %}{{ item.task }}"
-                    cells[1].text = "{{ item.owner }}"
-                    cells[2].text = "{{ item.deadline }}"
-                    cells[3].text = "{{ item.priority }}{%tr endfor %}"
-                elif len(cells) >= 3:
-                    cells[0].text = "{%tr for item in action_items %}{{ item.task }}"
-                    cells[1].text = "{{ item.owner }}"
-                    cells[2].text = "{{ item.deadline }}{%tr endfor %}"
-
-    out_stream = io.BytesIO()
-    doc.save(out_stream)
-    out_stream.seek(0)
-    return out_stream
-
-
-def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
-    doc = DocxTemplate(io.BytesIO(template_bytes))
-    context = data.model_dump()
-    for item in context.get("transcript", []):
-        item["text"] = item.get("translated_text") or item.get("original_text", "")
-    doc.render(context)
-    out_stream = io.BytesIO()
-    doc.save(out_stream)
-    out_stream.seek(0)
-    return out_stream
-
-
-def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
-    doc = Document()
-    doc.add_heading(data.title, level=0)
-    doc.add_paragraph(f"Date: {data.date}")
-    doc.add_paragraph(f"Attendees: {', '.join(data.attendees) if data.attendees else 'Not specified'}")
-
-    doc.add_heading("1. Executive Summary", level=1)
-    doc.add_paragraph(data.executive_summary)
-
-    doc.add_heading("2. Agenda Items & Decisions", level=1)
-    for idx, item in enumerate(data.agenda_and_decisions, 1):
-        doc.add_heading(f"2.{idx} {item.topic}", level=2)
-        doc.add_paragraph(f"Summary: {item.discussion_summary}")
-        if item.decisions_made:
-            doc.add_paragraph("Decisions Reached:", style="List Bullet")
-            for dec in item.decisions_made:
-                doc.add_paragraph(dec, style="List Bullet 2")
-
-    doc.add_heading("3. Action Items", level=1)
-    if data.action_items:
-        table = doc.add_table(rows=1, cols=4)
-        table.style = "Table Grid"
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Task"
-        hdr_cells[1].text = "Owner"
-        hdr_cells[2].text = "Deadline"
-        hdr_cells[3].text = "Priority"
-
-        for ai in data.action_items:
-            row_cells = table.add_row().cells
-            row_cells[0].text = ai.task
-            row_cells[1].text = ai.owner
-            row_cells[2].text = ai.deadline
-            row_cells[3].text = ai.priority
-
-    doc.add_heading("4. Speaker-Diarized Transcript (English)", level=1)
-    for entry in data.transcript:
-        ts = f"[{entry.timestamp}] " if entry.timestamp else ""
-        p = doc.add_paragraph()
-        runner = p.add_run(f"{ts}{entry.speaker}: ")
-        runner.bold = True
-        p.add_run(entry.translated_text)
-
-    out_stream = io.BytesIO()
-    doc.save(out_stream)
-    out_stream.seek(0)
-    return out_stream
-
-
-# -----------------------------------------------------------------------------
 # Main Application UI
 # -----------------------------------------------------------------------------
 def main():
@@ -631,7 +757,7 @@ def main():
     with h_col1:
         st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
     with h_col2:
-        if st.button("🔄 Start Over", use_container_width=True, help="Clear current session and reset all fields"):
+        if st.button("🔄 Start Over", use_container_width=True, help="Clear session and reset all fields"):
             for k in [
                 "meeting_result",
                 "usage_stats",
@@ -639,7 +765,6 @@ def main():
                 "active_template_bytes",
                 "converted_template_download",
                 "logs_list",
-                "is_processing",
             ]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -693,7 +818,7 @@ def main():
     col_left, col_right = st.columns([0.40, 0.60], gap="large")
 
     # =========================================================================
-    # LEFT PANEL: Workflow (1, 2, 3) + Execution Console
+    # LEFT PANEL: Sequenced Workflow (1, 2, 3) + Execution Console
     # =========================================================================
     with col_left:
         st.markdown("#### 1. Upload Audio")
@@ -709,7 +834,7 @@ def main():
         st.markdown("#### 2. Meeting Document Template")
         doc_choice = st.radio(
             "Template strategy:",
-            ["Default Clean Format", "Upload Tagged .docx", "Convert Sample Finished .docx"],
+            ["Default Clean Format", "Upload Tagged .docx", "AI Convert Sample Finished .docx"],
             horizontal=False,
             label_visibility="collapsed",
         )
@@ -723,43 +848,55 @@ def main():
                 st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
                 st.caption("✅ Custom Tagged Template Armed")
 
-        elif doc_choice == "Convert Sample Finished .docx":
-            sample_file = st.file_uploader("Upload Sample Finished (.docx)", type=["docx"], key="sample_docx")
+        elif doc_choice == "AI Convert Sample Finished .docx":
+            sample_file = st.file_uploader("Upload Finished Sample (.docx)", type=["docx"], key="sample_docx")
             if sample_file:
-                try:
-                    converted_io = convert_sample_docx_to_template(sample_file.getvalue())
-                    converted_bytes = converted_io.getvalue()
-                    st.session_state["active_template_bytes"] = converted_bytes
-                    st.session_state["converted_template_download"] = converted_bytes
+                tpl_status = st.empty()
+                if st.button("🤖 Build AI Template from Sample", use_container_width=True):
+                    active_key = st.session_state.get("api_key")
+                    active_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
+                    active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
 
-                    st.success("Template generated from sample!")
-                    st.download_button(
-                        label="📥 Download Generated Template (.docx)",
-                        data=converted_bytes,
-                        file_name="Generated_Meeting_Template.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                    )
-                except Exception as err:
-                    st.error(f"Sample parsing failed: {err}")
+                    if not active_key:
+                        st.error("API Key required for AI template generation. Configure it in ⚙️ Settings.")
+                    else:
+                        try:
+                            converted_io = generate_template_from_sample_ai(
+                                sample_bytes=sample_file.getvalue(),
+                                base_url=active_base,
+                                api_key=active_key,
+                                model_name=active_mod,
+                                status_container=tpl_status,
+                            )
+                            converted_bytes = converted_io.getvalue()
+                            st.session_state["active_template_bytes"] = converted_bytes
+                            st.session_state["converted_template_download"] = converted_bytes
+                            tpl_status.success("AI template successfully synthesized! All dummy text purged.")
+                        except Exception as err:
+                            tpl_status.error(f"AI conversion error: {err}")
+
+            if st.session_state.get("converted_template_download"):
+                st.download_button(
+                    label="📥 Download Generated Template (.docx)",
+                    data=st.session_state["converted_template_download"],
+                    file_name="AI_Generated_Meeting_Template.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
 
         st.markdown("#### 3. Process Meeting Audio")
         run_clicked = st.button("⚡ Process Meeting Audio", type="primary", use_container_width=True)
 
         st.markdown("---")
 
-        # Console Container
+        # LEFT BOTTOM: Execution Console
         st.markdown("#### 📟 Execution Console")
         status_text = st.empty()
         progress_bar = st.progress(0)
         log_container = st.empty()
 
-        # Render initial logs
-        initial_html = f"""
-        <div id="aima-terminal-box" class="terminal-container">
-            {"<br>".join(st.session_state["logs_list"])}
-        </div>
-        """
+        reversed_initial = "<br>".join(reversed(st.session_state["logs_list"]))
+        initial_html = f'<div id="aima-terminal-box" class="terminal-container">{reversed_initial}</div>'
         log_container.markdown(initial_html, unsafe_allow_html=True)
 
         stats = st.session_state.get("usage_stats")
