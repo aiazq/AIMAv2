@@ -2,7 +2,7 @@
 
 **AIMA** transforms multi-speaker meeting recordings into structured minutes, speaker-diarized transcripts, key decisions, and actionable items. It exports directly into formatted Microsoft Word (`.docx`) files using either a default executive layout or your team's custom Jinja-tagged templates.
 
-Powered by **Streamlit** and **Gemini 2.5 Flash**.
+Powered by **Streamlit** and **Gemini 3.6 Flash**.
 
 ---
 
