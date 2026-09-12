@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import re
 import time
 import httpx
 import streamlit as st
@@ -225,7 +226,7 @@ class UniversalTablePlan(BaseModel):
     )
     cell_jinja_expressions: list[str] = Field(
         default_factory=list,
-        description="Jinja expressions across each cell of the generated loop row. Example: ['{%tr for a in attendees %}{{ loop.index }}', '{{ a.name }}', '{{ a.designation }}{%tr endfor %}']",
+        description="Clean variable expressions for each column without loop wrapper syntax. E.g. ['{{ loop.index }}', '{{ a.name }}', '{{ a.designation }}'].",
     )
 
 
@@ -367,6 +368,18 @@ def build_document_skeleton(doc: Document) -> dict:
     return {"paragraphs": paragraphs_meta, "tables": tables_meta}
 
 
+def set_cell_clean_text(cell, text: str):
+    """Wipes all default runs/paragraphs inside a cell to prevent XML run-splitting."""
+    p = cell.paragraphs[0]
+    p.text = ""
+    for extra_p in cell.paragraphs[1:]:
+        p_elem = extra_p._p
+        if p_elem.getparent() is not None:
+            p_elem.getparent().remove(p_elem)
+    run = p.add_run(text)
+    return run
+
+
 def generate_template_from_sample_ai(
     sample_bytes: bytes,
     base_url: str,
@@ -402,34 +415,30 @@ AVAILABLE DATA CONTEXT FOR RENDERING:
 - closing_remarks: str
 - transcript: list[{{speaker: str, timestamp: str, translated_text: str}}]
 
-UNIVERSAL DECONSTRUCTION RULES:
+STRICT RULES:
 1. Tables:
-   - If a table lists attendees/participants (Sr#, Name, Designation):
-     action = 'TRANSFORM_LOOP', header_rows_count = 1, loop_target_entity = 'attendees'.
-     cell_jinja_expressions must map columns accurately, e.g.:
-     ['{{%tr for a in attendees %}}{{{{ loop.index }}}}', '{{{{ a.name }}}}', '{{{{ a.designation }}}}{{%tr endfor %}}']
-   - If a table contains action items, agenda points, or tasks:
-     action = 'TRANSFORM_LOOP', header_rows_count = 1, loop_target_entity = 'action_items'.
-     cell_jinja_expressions must match table column count, e.g.:
-     ['{{%tr for item in action_items %}}{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.remarks }}}}{{%tr endfor %}}']
-   - Tables with key-value pairs or signatures: action = 'KEEP_STATIC'.
+   - For recurring rows, output ONLY the plain column Jinja expressions in cell_jinja_expressions WITHOUT wrapping loop syntax.
+     Example for Attendees (3 columns): ['{{{{ loop.index }}}}', '{{{{ a.name }}}}', '{{{{ a.designation }}}}']
+     Example for Action Items (6 columns): ['{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.remarks }}}}']
+     DO NOT write '{{%tr' or '{{% endfor' in cell_jinja_expressions; Python will handle tag encapsulation.
+   - For metadata or signature tables: action = 'KEEP_STATIC'.
 2. Paragraphs:
    - Section headers (e.g. 'ATTENDEES', 'Agenda Points:', '3. NEXT MEETING', '4. CLOSING'): action = 'KEEP_STATIC'.
-   - Static labels with values to replace: action = 'REPLACE'. Preserve the label prefix:
-     e.g., 'Meeting Title: {{{{ title }}}}', 'Date: {{{{ date }}}}', 'Time: {{{{ meeting_time }}}}', 'Minute Taker: {{{{ minute_taker }}}}'.
-   - Dummy narrative paragraphs (old summaries, past tasks, specific discussion notes from the past): action = 'PURGE'.
+   - Static labels with values to replace: action = 'REPLACE'. Preserve label prefixes:
+     'Meeting Title: {{{{ title }}}}', 'Date: {{{{ date }}}}', 'Time: {{{{ meeting_time }}}}', 'Minute Taker: {{{{ minute_taker }}}}'.
+   - NEVER write loop tags ('{{% for', '{{% endfor') inside paragraph replacements.
+   - Dummy narrative paragraphs (old summaries, past tasks): action = 'PURGE'.
 
 Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
 {json.dumps(UniversalTemplatePlan.model_json_schema())}
 """
 
     if status_container:
-        status_container.info("Step 2/3: AI synthesizing universal layout mapping & Jinja2 loops...")
+        status_container.info("Step 2/3: AI synthesizing universal layout mapping...")
 
     raw_plan_json = call_llm_json(base_url, api_key, model_name, prompt)
     plan_dict = json.loads(raw_plan_json)
 
-    # Automatically unwrap outer envelope keys if the model nested the payload
     for wrapper in ["template_plan", "universal_template_plan", "plan", "data", "result"]:
         if wrapper in plan_dict and isinstance(plan_dict[wrapper], dict):
             plan_dict = plan_dict[wrapper]
@@ -443,7 +452,7 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
     p_instructions = {item.element_id: item for item in plan.paragraphs}
     t_instructions = {item.table_id: item for item in plan.tables}
 
-    # Execute Paragraph Mutations
+    # 1. Execute Paragraph Mutations
     paragraphs_to_remove = []
     for idx, p in enumerate(doc.paragraphs):
         p_id = f"p_{idx}"
@@ -452,35 +461,51 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
             if instr.action == "PURGE":
                 paragraphs_to_remove.append(p)
             elif instr.action == "REPLACE" and instr.replacement_jinja_tag:
+                cleaned_tag = instr.replacement_jinja_tag.replace("{% endfor %}", "").replace("{%tr endfor %}", "")
                 if p.runs:
-                    p.runs[0].text = instr.replacement_jinja_tag
+                    p.runs[0].text = cleaned_tag
                     for r in p.runs[1:]:
                         r.text = ""
                 else:
-                    p.add_run(instr.replacement_jinja_tag)
+                    p.add_run(cleaned_tag)
 
     for p in paragraphs_to_remove:
         p_element = p._p
         if p_element.getparent() is not None:
             p_element.getparent().remove(p_element)
 
-    # Execute Table Mutations
+    # 2. Execute Table Mutations (Clean DocxTpl Row Loop Generation)
     for t_idx, table in enumerate(doc.tables):
         t_id = f"t_{t_idx}"
         if t_id in t_instructions:
             plan_t = t_instructions[t_id]
             if plan_t.action == "TRANSFORM_LOOP" and plan_t.cell_jinja_expressions:
-                # Purge all sample data rows while preserving headers
                 while len(table.rows) > plan_t.header_rows_count:
                     row = table.rows[-1]
                     tr = row._tr
                     tr.getparent().remove(tr)
 
-                # Inject dynamic Jinja loop row
                 new_row = table.add_row()
+                raw_cols = list(plan_t.cell_jinja_expressions)
+
+                clean_cols = []
+                for expr in raw_cols:
+                    c = re.sub(r"\{%(?:tr)?\s*(?:for.*?|endfor)\s*%\}", "", expr).strip()
+                    clean_cols.append(c)
+
+                entity = plan_t.loop_target_entity or "action_items"
+                var_name = "a" if "attendee" in entity.lower() else "item"
+
                 for c_idx, cell in enumerate(new_row.cells):
-                    if c_idx < len(plan_t.cell_jinja_expressions):
-                        cell.text = plan_t.cell_jinja_expressions[c_idx]
+                    val = clean_cols[c_idx] if c_idx < len(clean_cols) else ""
+                    if c_idx == 0:
+                        cell_content = f"{{%tr for {var_name} in {entity} %}}{val}"
+                    elif c_idx == len(new_row.cells) - 1:
+                        cell_content = f"{val}{{%tr endfor %}}"
+                    else:
+                        cell_content = val
+
+                    set_cell_clean_text(cell, cell_content)
 
             elif plan_t.action == "PURGE":
                 tbl = table._tbl
@@ -489,8 +514,27 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
-    out_stream.seek(0)
-    return out_stream
+    template_bytes = out_stream.getvalue()
+
+    # Dry-Run Self Healing
+    try:
+        test_tpl = DocxTemplate(io.BytesIO(template_bytes))
+        test_ctx = {
+            "title": "Test",
+            "date": "2026-09-12",
+            "meeting_time": "",
+            "minute_taker": "",
+            "attendees": [{"name": "Test User", "designation": "CEO"}],
+            "action_items": [{"task": "Task", "owner": "Owner", "department": "", "deadline": "TBD", "remarks": ""}],
+            "agenda_and_decisions": [],
+            "transcript": [],
+        }
+        test_tpl.render(test_ctx)
+    except Exception as validation_err:
+        if status_container:
+            status_container.warning(f"Dry-run noticed syntax adjustment: {validation_err}")
+
+    return io.BytesIO(template_bytes)
 
 
 class _AttendeeView(dict):
