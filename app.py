@@ -37,14 +37,14 @@ st.markdown(
     }
 
     .block-container {
-        padding-top: 2.1rem !important;
+        padding-top: 4.75rem !important;
         padding-bottom: 3rem !important;
         padding-left: clamp(1rem, 3vw, 3.25rem) !important;
         padding-right: clamp(1rem, 3vw, 3.25rem) !important;
         max-width: 1560px !important;
     }
 
-    div[data-testid="stPopover"] { margin-top: 0.15rem; }
+    div[data-testid="stPopover"] { margin-top: 0.75rem; }
 
     button[aria-label="Show password text"],
     button[aria-label="Hide password text"],
@@ -659,6 +659,8 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 # Main Application
 # -----------------------------------------------------------------------------
 def main():
+    st.markdown('<div style="height:0.65rem"></div>', unsafe_allow_html=True)
+
     # Brand header
     h_col1, h_col2 = st.columns([0.78, 0.22], vertical_alignment="center")
     with h_col1:
@@ -677,6 +679,7 @@ def main():
                 value="",
                 type="password",
                 placeholder="••••••••••••••••" if has_key else "Paste key...",
+                key="settings_api_key",
             )
             if new_key.strip():
                 st.session_state["api_key"] = new_key.strip()
@@ -687,6 +690,7 @@ def main():
                 "Provider Endpoint URL:",
                 value=current_base,
                 help="Base URL without model path",
+                key="settings_base_url",
             )
             if new_base != current_base:
                 st.session_state["base_url"] = new_base.strip()
@@ -699,9 +703,9 @@ def main():
             models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
             curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
             idx = models_list.index(curr_model) if curr_model in models_list else 0
-            st.session_state["selected_model"] = st.selectbox("Active AI Model:", options=models_list, index=idx)
+            st.session_state["selected_model"] = st.selectbox("Active AI Model:", options=models_list, index=idx, key="settings_active_model")
 
-            if st.button("🔄 Refresh Models List", use_container_width=True):
+            if st.button("🔄 Refresh Models List", use_container_width=True, key="settings_refresh_models"):
                 st.session_state["available_models"] = fetch_available_models(
                     st.session_state["base_url"], st.session_state.get("api_key", "")
                 )
