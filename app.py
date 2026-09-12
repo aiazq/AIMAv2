@@ -122,9 +122,6 @@ if "usage_stats" not in st.session_state:
 if "is_processing" not in st.session_state:
     st.session_state["is_processing"] = False
 
-if "stop_requested" not in st.session_state:
-    st.session_state["stop_requested"] = False
-
 
 # -----------------------------------------------------------------------------
 # Quips Collection
@@ -271,7 +268,6 @@ def analyze_meeting_audio_rest(
     status_text,
     log_container,
     logs_list,
-    stop_button_ph,
 ) -> tuple[MeetingMinutesReport | None, dict | None]:
     file_size_mb = len(audio_file_bytes) / (1024 * 1024)
     log_event(log_container, logs_list, f"Ingested raw stream: {file_size_mb:.2f} MB ({mime_type})", "INFO")
@@ -368,14 +364,6 @@ def analyze_meeting_audio_rest(
     pct = 35
 
     while not future.done():
-        if stop_button_ph.button("🛑 Stop Processing", key="btn_stop_processing", type="secondary"):
-            st.session_state["stop_requested"] = True
-            log_event(log_container, logs_list, "Execution aborted by user.", "WARN")
-            progress_bar.empty()
-            status_text.warning("Processing stopped.")
-            stop_button_ph.empty()
-            return None, None
-
         time.sleep(1.2)
         elapsed = time.time() - req_start
 
@@ -395,8 +383,6 @@ def analyze_meeting_audio_rest(
             )
             quip_idx += 1
             last_quip_time = time.time()
-
-    stop_button_ph.empty()
 
     response = future.result()
     latency = time.time() - req_start
@@ -512,7 +498,6 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
 # Template Creation & Population Engine
 # -----------------------------------------------------------------------------
 def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
-    """Consolidates runs and substitutes structure tags for bulletproof docxtpl rendering."""
     doc = Document(io.BytesIO(sample_bytes))
 
     def replace_keywords_in_paragraph(p):
@@ -580,7 +565,6 @@ def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
 def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
-    # Provide 'text' field fallback for template backwards compatibility
     for item in context.get("transcript", []):
         item["text"] = item.get("translated_text") or item.get("original_text", "")
     doc.render(context)
@@ -643,7 +627,6 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 # Main Application UI
 # -----------------------------------------------------------------------------
 def main():
-    # Top Header Strip with 'Start Over' Button
     h_col1, h_col2, h_col3 = st.columns([0.65, 0.18, 0.17], vertical_alignment="center")
     with h_col1:
         st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
@@ -656,6 +639,7 @@ def main():
                 "active_template_bytes",
                 "converted_template_download",
                 "logs_list",
+                "is_processing",
             ]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -709,7 +693,7 @@ def main():
     col_left, col_right = st.columns([0.40, 0.60], gap="large")
 
     # =========================================================================
-    # LEFT PANEL: Sequenced Workflow (1, 2, 3) + Telemetry Console
+    # LEFT PANEL: Workflow (1, 2, 3) + Execution Console
     # =========================================================================
     with col_left:
         st.markdown("#### 1. Upload Audio")
@@ -760,15 +744,11 @@ def main():
                     st.error(f"Sample parsing failed: {err}")
 
         st.markdown("#### 3. Process Meeting Audio")
-        run_col1, run_col2 = st.columns([0.65, 0.35])
-        with run_col1:
-            run_clicked = st.button("⚡ Process Meeting Audio", type="primary", use_container_width=True)
-        with run_col2:
-            stop_ph = st.empty()
+        run_clicked = st.button("⚡ Process Meeting Audio", type="primary", use_container_width=True)
 
         st.markdown("---")
 
-        # LEFT BOTTOM: Execution Console
+        # Console Container
         st.markdown("#### 📟 Execution Console")
         status_text = st.empty()
         progress_bar = st.progress(0)
@@ -843,7 +823,6 @@ def main():
                     status_text=status_text,
                     log_container=log_container,
                     logs_list=st.session_state["logs_list"],
-                    stop_button_ph=stop_ph,
                 )
 
                 if report:
