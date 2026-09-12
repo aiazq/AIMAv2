@@ -63,6 +63,22 @@ def load_real():
         return f.read()
 
 
+def pid_of(text_fragment, sample=None):
+    """Find a paragraph's p_id by its TEXT, not by index.
+
+    Plans are keyed by p_id, and the real sample (gitignored) has different
+    paragraph indices from the synthetic stand-in. Hardcoding 'p_7' therefore
+    makes a test pass on one sample and fail on the other. Look the id up from the
+    text instead so the suite is sample-agnostic and runs on a fresh clone.
+    """
+    with open(sample or SAMPLE, "rb") as f:
+        doc = Document(io.BytesIO(f.read()))
+    for i, p in enumerate(doc.paragraphs):
+        if text_fragment.lower() in p.text.lower():
+            return f"p_{i}"
+    raise AssertionError(f"no paragraph containing {text_fragment!r} in {sample or SAMPLE}")
+
+
 def render(template_bytes, ctx, autoescape=True):
     tpl = DocxTemplate(io.BytesIO(template_bytes))
     tpl.render(ctx, autoescape=autoescape)
@@ -441,8 +457,8 @@ def test_model_purge_on_placeholder_is_recovered():
     override must fire for PURGE too, not just KEEP_STATIC."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_7", "action": "PURGE", "cleaned_template_text": ""},
+            {"p_id": pid_of("ACTION ITEMS"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("Action Items Table goes here"), "action": "PURGE", "cleaned_template_text": ""},
         ],
         "tables": [],
     }
@@ -472,8 +488,8 @@ def test_model_keep_static_on_placeholder_is_recovered():
     build the loop anyway."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_7", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("ACTION ITEMS"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("Action Items Table goes here"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
         ],
         "tables": [],
     }
@@ -502,7 +518,7 @@ def test_placeholder_without_known_heading_is_removed_not_shipped():
     """An unresolvable placeholder must never be printed into client output."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_7", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("Action Items Table goes here"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
         ],
         "tables": [],
     }
@@ -517,8 +533,8 @@ def test_edit_box_placeholder_resolves_by_heading_text():
     its heading wording."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_19", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_20", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("DIARIZED TRANSCRIPT"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("transcript with translation text goes here"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
         ],
         "tables": [],
     }
@@ -533,7 +549,7 @@ def test_model_keep_static_on_real_dummy_text_is_preserved():
     """Regression guard: the placeholder detector must not swallow ordinary text."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_12", "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("Discussion/update on the tasks assigned"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
         ],
         "tables": [],
     }
@@ -710,8 +726,8 @@ def test_placeholder_paragraph_becomes_collection_loop():
     loop over that collection, not be purged."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_6", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_7", "action": "REPLACE_TEMPLATE",
+            {"p_id": pid_of("ACTION ITEMS"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("Action Items Table goes here"), "action": "REPLACE_TEMPLATE",
              "collection": "action_items",
              "cleaned_template_text": BODY_AI},
         ],
@@ -753,8 +769,8 @@ def test_transcript_placeholder_becomes_loop():
     """The transcript section must likewise become a loop over `transcript`."""
     plan = {
         "paragraphs": [
-            {"p_id": "p_19", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_20", "action": "REPLACE_TEMPLATE",
+            {"p_id": pid_of("DIARIZED TRANSCRIPT"), "action": "KEEP_STATIC", "cleaned_template_text": ""},
+            {"p_id": pid_of("transcript with translation text goes here"), "action": "REPLACE_TEMPLATE",
              "collection": "transcript",
              "cleaned_template_text": BODY_TX},
         ],
@@ -825,23 +841,28 @@ def test_loop_body_uses_matching_variable():
 
 def test_purged_and_static_paragraphs_still_work():
     """Regression: adding collection support must not break PURGE / KEEP_STATIC /
-    plain REPLACE_TEMPLATE."""
+    plain REPLACE_TEMPLATE on ORDINARY paragraphs.
+
+    Note: a section placeholder is deliberately exempt from PURGE (that override is
+    the whole point of the fix), so this checks ordinary paragraphs only.
+    """
     plan = {
         "paragraphs": [
-            {"p_id": "p_6", "action": "PURGE"},
-            {"p_id": "p_12", "action": "PURGE"},
-            {"p_id": "p_9", "action": "KEEP_STATIC", "cleaned_template_text": ""},
-            {"p_id": "p_17", "action": "REPLACE_TEMPLATE",
+            {"p_id": pid_of("Discussion/update on the tasks assigned"), "action": "PURGE"},
+            {"p_id": pid_of("Agenda Points:"), "action": "KEEP_STATIC",
+             "cleaned_template_text": ""},
+            {"p_id": pid_of("CLOSING"), "action": "REPLACE_TEMPLATE",
              "cleaned_template_text": "CLOSING\n{{ closing_remarks }}"},
         ],
         "tables": [],
     }
     tpl = convert(load_real(), plan)
     DocxTemplate(io.BytesIO(tpl))
-    body = "\n".join(p.text for p in Document(io.BytesIO(tpl)).paragraphs)
-    assert "ACTION ITEMS" not in body, "PURGE ignored"
+    paras = [p.text for p in Document(io.BytesIO(tpl)).paragraphs]
+    body = "\n".join(paras)
     assert "Discussion/update on the tasks assigned;" not in body, "PURGE ignored"
-    assert "Date:\u00a011/09/2026" in body, "KEEP_STATIC paragraph lost"
+    assert "Agenda Points:" in body, "KEEP_STATIC paragraph lost"
     assert "{{ closing_remarks }}" in body, "plain REPLACE_TEMPLATE lost"
-    assert "{%p for" not in body
+    assert "{%p for" not in body, (
+        f"an unexpected loop was emitted for ordinary paragraphs: {paras!r}")
 

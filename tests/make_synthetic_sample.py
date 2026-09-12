@@ -77,6 +77,7 @@ def build(path):
 
     doc.add_paragraph("Agenda Points:")
     doc.add_paragraph("1. REVIEW OF PROGRESS")
+    doc.add_paragraph("Discussion/update on the tasks assigned;")
     doc.add_paragraph("2. VENDOR PERFORMANCE")
     doc.add_paragraph("3. NEXT MEETING")
 
@@ -86,8 +87,19 @@ def build(path):
             [2, "Item two", "Old action two", "Operations", "TBD", ""],
             [3, "Item three", "Old action three", "Finance", "20 Sep", ""]])
 
+    # --- appended repeater sections (the shape the client added later) --------
+    # A heading followed by a placeholder paragraph standing in for a LIST. These
+    # are the "action items section" and "transcript section" that must become
+    # {%p for %} loops rather than being purged. Kept in the synthetic sample so
+    # the golden suite can prove the behaviour on a fresh clone.
+    doc.add_paragraph("ACTION ITEMS")
+    doc.add_paragraph("<Action Items Table goes here>")
+
     doc.add_paragraph("4. CLOSING")
     doc.add_paragraph("The meeting was adjourned.")
+
+    doc.add_paragraph("COMPLETE DIARIZED TRANSCRIPT OF MEETING WITH TRANSLATION:")
+    doc.add_paragraph("The complete transcript with translation text goes here")
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     doc.save(path)
