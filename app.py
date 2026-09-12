@@ -1,8 +1,10 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import io
 import json
 import os
+import random
 import time
 import httpx
 import streamlit as st
@@ -20,11 +22,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Custom Styling for Workstation View and Button Positioning
 st.markdown(
     """
     <style>
-    /* Ensure header controls are fully visible below Streamlit's native header */
     .block-container {
         padding-top: 3.2rem !important;
         padding-bottom: 2rem !important;
@@ -33,12 +33,10 @@ st.markdown(
         max-width: 100% !important;
     }
 
-    /* Spacing for the settings popover trigger */
     div[data-testid="stPopover"] {
         margin-top: 0.35rem;
     }
 
-    /* Remove Streamlit password reveal eyes */
     button[aria-label="Show password text"],
     button[aria-label="Hide password text"],
     input[type="password"]::-ms-reveal,
@@ -48,13 +46,43 @@ st.markdown(
         pointer-events: none !important;
     }
 
-    /* Telemetry cards */
     div[data-testid="stMetric"] {
         background-color: var(--secondary-background-color);
         padding: 0.5rem 0.75rem;
         border-radius: 6px;
         border: 1px solid rgba(128, 128, 128, 0.15);
     }
+
+    /* Terminal Console Box */
+    .terminal-container {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.82rem;
+        background-color: #0b0f19;
+        color: #d1d5db;
+        padding: 0.85rem;
+        border-radius: 8px;
+        height: 310px;
+        overflow-y: auto;
+        border: 1px solid #1f2937;
+        line-height: 1.45;
+        white-space: pre-wrap;
+    }
+
+    /* Smaller, styled quip logs */
+    .log-quip {
+        font-size: 0.70rem !important;
+        color: #94a3b8 !important;
+        font-style: italic;
+        padding-left: 0.5rem;
+        display: block;
+        margin: 2px 0;
+    }
+
+    .log-info { color: #38bdf8; }
+    .log-debug { color: #9ca3af; }
+    .log-warn { color: #fbbf24; }
+    .log-error { color: #f87171; }
+    .log-success { color: #4ade80; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -85,10 +113,33 @@ if "active_template_bytes" not in st.session_state:
     st.session_state["active_template_bytes"] = None
 
 if "logs_list" not in st.session_state:
-    st.session_state["logs_list"] = ["[System] Ready. Waiting for user input..."]
+    st.session_state["logs_list"] = [
+        '<span class="log-debug">[System] Ready. Awaiting audio recording...</span>'
+    ]
 
 if "usage_stats" not in st.session_state:
     st.session_state["usage_stats"] = None
+
+
+# -----------------------------------------------------------------------------
+# Quips Registry
+# -----------------------------------------------------------------------------
+FUNNY_QUIPS = [
+    "Translating 'per my last email' into diplomatic corporate prose...",
+    "Detecting who spoke for 45 seconds while double-muted...",
+    "Calculating how many agenda points could have been a quick Slack message...",
+    "Politely ignoring the dog barking in Speaker 2's background...",
+    "Extracting action items that everyone pretended not to hear...",
+    "Filtering out the phrase 'Can everyone see my screen?'...",
+    "Determining if 'Let's take this offline' means 'Let's never discuss this again'...",
+    "Synergizing the paradigms and operationalizing low-hanging fruit...",
+    "Teaching the neural net to distinguish insightful pauses from coffee sipping...",
+    "Cross-referencing promises made with realistic human capabilities...",
+    "Decoding corporate buzzwords into plain human English...",
+    "Compiling artificial executive confidence into the summary...",
+    "Reconstructing what was said right before someone's Wi-Fi dropped...",
+    "Ensuring all circled backs are sufficiently aligned...",
+]
 
 
 # -----------------------------------------------------------------------------
@@ -133,7 +184,7 @@ class MeetingMinutesReport(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Model Discovery & REST Pipeline
+# Helpers & Model Discovery
 # -----------------------------------------------------------------------------
 def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     cleaned_base = base_url.rstrip("/")
@@ -165,9 +216,31 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
 
 def log_event(log_container, logs_list, message: str, level: str = "INFO"):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    formatted_log = f"[{ts}] [{level}] {message}"
-    logs_list.append(formatted_log)
-    log_container.code("\n".join(logs_list), language="log")
+    level_css = {
+        "INFO": "log-info",
+        "DEBUG": "log-debug",
+        "WARN": "log-warn",
+        "ERROR": "log-error",
+        "SUCCESS": "log-success",
+        "QUIP": "log-quip",
+    }.get(level, "log-debug")
+
+    if level == "QUIP":
+        entry = f'<span class="log-quip">[{ts}] 💬 {message}</span>'
+    else:
+        entry = f'<span>[{ts}] <span class="{level_css}">[{level}]</span> {message}</span>'
+
+    logs_list.append(entry)
+    html_output = f'<div class="terminal-container">{"<br>".join(logs_list)}</div>'
+    log_container.markdown(html_output, unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# Asynchronous Background Worker & Telemetry
+# -----------------------------------------------------------------------------
+def dispatch_http_request(endpoint_url: str, headers: dict, payload: dict) -> httpx.Response:
+    with httpx.Client(timeout=360.0) as client:
+        return client.post(endpoint_url, headers=headers, json=payload)
 
 
 def analyze_meeting_audio_rest(
@@ -182,15 +255,16 @@ def analyze_meeting_audio_rest(
     logs_list,
 ) -> tuple[MeetingMinutesReport, dict]:
     file_size_mb = len(audio_file_bytes) / (1024 * 1024)
-    log_event(log_container, logs_list, f"Ingested audio: {file_size_mb:.2f} MB ({mime_type})")
+    log_event(log_container, logs_list, f"Ingested raw stream: {file_size_mb:.2f} MB ({mime_type})", "INFO")
 
-    status_text.text("Encoding audio buffer...")
-    progress_bar.progress(15)
+    status_text.markdown("🔄 *Encoding audio stream to base64...*")
+    progress_bar.progress(10)
 
     b64_start = time.time()
     b64_audio = base64.b64encode(audio_file_bytes).decode("utf-8")
-    log_event(log_container, logs_list, f"Base64 encoded in {time.time() - b64_start:.2f}s ({len(b64_audio):,} chars)")
-    progress_bar.progress(35)
+    b64_duration = time.time() - b64_start
+    log_event(log_container, logs_list, f"Base64 complete: {len(b64_audio):,} chars in {b64_duration:.2f}s", "DEBUG")
+    progress_bar.progress(25)
 
     prompt = (
         "You are an expert executive meeting assistant. Listen carefully to this meeting audio recording:\n"
@@ -259,31 +333,62 @@ def analyze_meeting_audio_rest(
             "temperature": 0.2,
         }
 
-    log_event(log_container, logs_list, f"Dispatching inference to: {endpoint_url}")
-    status_text.text(f"Running audio inference via {model_name}...")
-    progress_bar.progress(55)
+    log_event(log_container, logs_list, f"Dispatching POST request to: {endpoint_url}", "DEBUG")
+    progress_bar.progress(35)
+
+    # Launch inference in background thread
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(dispatch_http_request, endpoint_url, headers, payload)
 
     req_start = time.time()
-    with httpx.Client(timeout=360.0) as client:
-        response = client.post(endpoint_url, headers=headers, json=payload)
+    quip_pool = list(FUNNY_QUIPS)
+    random.shuffle(quip_pool)
+    quip_idx = 0
+    last_quip_time = req_start
+    pct = 35
+
+    # Interactive polling loop while remote model processes audio
+    while not future.done():
+        time.sleep(1.2)
+        elapsed = time.time() - req_start
+
+        # Gradually advance progress bar toward 85%
+        if pct < 85:
+            pct += 1
+            progress_bar.progress(pct)
+
+        # Rotate quip and heartbeat every 7 seconds
+        if time.time() - last_quip_time > 7.0:
+            current_quip = quip_pool[quip_idx % len(quip_pool)]
+            status_text.markdown(f"💬 *{current_quip}*")
+            log_event(log_container, logs_list, current_quip, "QUIP")
+            log_event(
+                log_container,
+                logs_list,
+                f"Heartbeat: Model reasoning active... (elapsed: {int(elapsed)}s)",
+                "DEBUG",
+            )
+            quip_idx += 1
+            last_quip_time = time.time()
+
+    response = future.result()
     latency = time.time() - req_start
 
     log_event(
         log_container,
         logs_list,
-        f"Provider response: HTTP {response.status_code} in {latency:.2f}s",
-        level="INFO" if response.status_code == 200 else "ERROR",
+        f"Provider response received in {latency:.2f}s (HTTP {response.status_code})",
+        "SUCCESS" if response.status_code == 200 else "ERROR",
     )
 
     if response.status_code != 200:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
 
-    progress_bar.progress(85)
-    status_text.text("Parsing structured payload & usage metrics...")
+    progress_bar.progress(90)
+    status_text.markdown("⚡ *Validating JSON structure and parsing usage metadata...*")
 
     res_json = response.json()
 
-    # Extract Usage Telemetry (including thoughts/reasoning tokens)
     prompt_tokens = 0
     completion_tokens = 0
     thoughts_tokens = 0
@@ -299,12 +404,10 @@ def analyze_meeting_audio_rest(
         usage = res_json["usage"]
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
-        # Check for reasoning_tokens inside completion_tokens_details if available
         details = usage.get("completion_tokens_details", {})
         thoughts_tokens = details.get("reasoning_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
 
-    # Extract Content
     if "candidates" in res_json:
         raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
     elif "choices" in res_json:
@@ -335,21 +438,15 @@ def analyze_meeting_audio_rest(
         "model": model_name,
     }
 
-    if thoughts_tokens > 0:
-        log_event(
-            log_container,
-            logs_list,
-            f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output + {thoughts_tokens:,} thinking) | {latency:.2f}s",
-        )
-    else:
-        log_event(
-            log_container,
-            logs_list,
-            f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output) | {latency:.2f}s",
-        )
+    log_event(
+        log_container,
+        logs_list,
+        f"Usage validated: {total_tokens:,} tokens ({prompt_tokens:,} prompt, {completion_tokens:,} output, {thoughts_tokens:,} thinking)",
+        "INFO",
+    )
 
     progress_bar.progress(100)
-    status_text.text("Processing Complete!")
+    status_text.markdown("✅ **Processing Complete! Ready to review.**")
     return report, stats
 
 
@@ -525,7 +622,7 @@ def main():
             new_base = st.text_input(
                 "Provider Endpoint URL:",
                 value=current_base,
-                help="Base URL without model path (e.g., [https://generativelanguage.googleapis.com/v1beta](https://generativelanguage.googleapis.com/v1beta) or [https://api.openai.com/v1](https://api.openai.com/v1))",
+                help="Base URL without model path",
             )
             if new_base != current_base:
                 st.session_state["base_url"] = new_base.strip()
@@ -600,19 +697,20 @@ def main():
 
         # LEFT BOTTOM: Real-time Execution Console & Telemetry
         st.markdown("#### 📟 Execution Console")
-        progress_bar = st.progress(0)
         status_text = st.empty()
+        progress_bar = st.progress(0)
         log_container = st.empty()
-        log_container.code("\n".join(st.session_state["logs_list"]), language="log")
+
+        # Render current log state
+        initial_html = f'<div class="terminal-container">{"<br>".join(st.session_state["logs_list"])}</div>'
+        log_container.markdown(initial_html, unsafe_allow_html=True)
 
         # Telemetry & Usage Statistics Display
         stats = st.session_state.get("usage_stats")
         if stats:
             st.markdown("##### 📊 Telemetry & Usage Stats")
-
             has_thoughts = stats.get("thoughts_tokens", 0) > 0
 
-            # Grid 1: Token Breakdown
             if has_thoughts:
                 t_cols = st.columns(4)
                 with t_cols[0]:
@@ -632,7 +730,6 @@ def main():
                 with t_cols[2]:
                     st.metric("Total Tokens", f"{stats['total_tokens']:,}")
 
-            # Grid 2: Performance Metrics
             p_cols = st.columns(2)
             with p_cols[0]:
                 st.metric("Latency", f"{stats['latency']:.2f}s")
@@ -654,7 +751,7 @@ def main():
                 return
 
             st.session_state["logs_list"] = []
-            log_event(log_container, st.session_state["logs_list"], "Starting execution sequence...")
+            log_event(log_container, st.session_state["logs_list"], "Starting execution sequence...", "INFO")
 
             try:
                 audio_bytes = audio_file.read()
@@ -679,7 +776,7 @@ def main():
             except Exception as e:
                 progress_bar.empty()
                 status_text.empty()
-                log_event(log_container, st.session_state["logs_list"], f"Pipeline failed: {str(e)}", level="ERROR")
+                log_event(log_container, st.session_state["logs_list"], f"Pipeline failed: {str(e)}", "ERROR")
                 st.error(f"Error: {e}")
                 return
 
