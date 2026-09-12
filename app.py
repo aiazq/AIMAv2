@@ -212,7 +212,8 @@ class UniversalParagraphPlan(BaseModel):
 class UniversalTablePlan(BaseModel):
     table_id: str = Field(description="Coordinate id of table, e.g., 't_0'.")
     table_purpose: str = Field(
-        description="Semantic purpose identified, e.g., 'attendees_roster', 'action_items', 'metadata_kv', 'agenda_grid'."
+        default="",
+        description="Semantic purpose identified, e.g., 'attendees_roster', 'action_items', 'metadata_kv', 'agenda_grid'.",
     )
     action: str = Field(
         description="'TRANSFORM_LOOP' to turn into repeating rows, 'KEEP_STATIC' for static layout/signatures, or 'PURGE' to delete."
@@ -229,8 +230,8 @@ class UniversalTablePlan(BaseModel):
 
 
 class UniversalTemplatePlan(BaseModel):
-    paragraphs: list[UniversalParagraphPlan]
-    tables: list[UniversalTablePlan]
+    paragraphs: list[UniversalParagraphPlan] = Field(default_factory=list)
+    tables: list[UniversalTablePlan] = Field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -418,7 +419,8 @@ UNIVERSAL DECONSTRUCTION RULES:
      e.g., 'Meeting Title: {{{{ title }}}}', 'Date: {{{{ date }}}}', 'Time: {{{{ meeting_time }}}}', 'Minute Taker: {{{{ minute_taker }}}}'.
    - Dummy narrative paragraphs (old summaries, past tasks, specific discussion notes from the past): action = 'PURGE'.
 
-Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema.
+Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
+{json.dumps(UniversalTemplatePlan.model_json_schema())}
 """
 
     if status_container:
@@ -426,6 +428,13 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema.
 
     raw_plan_json = call_llm_json(base_url, api_key, model_name, prompt)
     plan_dict = json.loads(raw_plan_json)
+
+    # Automatically unwrap outer envelope keys if the model nested the payload
+    for wrapper in ["template_plan", "universal_template_plan", "plan", "data", "result"]:
+        if wrapper in plan_dict and isinstance(plan_dict[wrapper], dict):
+            plan_dict = plan_dict[wrapper]
+            break
+
     plan = UniversalTemplatePlan(**plan_dict)
 
     if status_container:
