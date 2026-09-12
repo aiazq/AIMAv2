@@ -2,6 +2,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import io
+from html import escape
 import json
 import os
 import random
@@ -841,7 +842,7 @@ def main():
             with st.container(border=True):
                 header_col, download_col = st.columns([0.72, 0.28], vertical_alignment="top")
                 with header_col:
-                    st.markdown(f'<div class="eyebrow">Meeting brief</div><div class="result-title">{result.title}</div><div class="result-meta">📅 {result.date} &nbsp;·&nbsp; 👥 {attendee_count} attendee{"s" if attendee_count != 1 else ""}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="eyebrow">Meeting brief</div><div class="result-title">{escape(str(result.title))}</div><div class="result-meta">📅 {escape(str(result.date))} &nbsp;·&nbsp; 👥 {attendee_count} attendee{"s" if attendee_count != 1 else ""}</div>', unsafe_allow_html=True)
                 with download_col:
                     if active_template:
                         try:
@@ -887,7 +888,7 @@ def main():
                 tab_overview, tab_actions, tab_transcript, tab_raw = st.tabs(["Overview", "Action items", "Transcript", "Raw data"])
                 with tab_overview:
                     st.markdown('<div class="summary-label">Executive summary</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="summary-card">{result.executive_summary}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="summary-card">{escape(str(result.executive_summary))}</div>', unsafe_allow_html=True)
                     st.markdown("### Agenda & decisions")
                     if result.agenda_and_decisions:
                         for item in result.agenda_and_decisions:
@@ -909,7 +910,7 @@ def main():
                         for item in result.action_items:
                             priority_value = str(item.priority or "Unspecified")
                             priority_class = priority_value.lower() if priority_value.lower() in ["high", "medium", "low"] else "default"
-                            cards.append(f'<div class="action-card"><div><div class="action-task">{item.task}</div><div class="action-meta">Owner: {item.owner} &nbsp;·&nbsp; Due: {item.deadline}</div></div><span class="priority priority-{priority_class}">{priority_value}</span></div>')
+                            cards.append(f'<div class="action-card"><div><div class="action-task">{escape(str(item.task))}</div><div class="action-meta">Owner: {escape(str(item.owner))} &nbsp;·&nbsp; Due: {escape(str(item.deadline))}</div></div><span class="priority priority-{priority_class}">{escape(priority_value)}</span></div>')
                         st.markdown("".join(cards), unsafe_allow_html=True)
                     else:
                         st.info("No action items detected in the discussion.")
@@ -921,8 +922,8 @@ def main():
                         for entry in result.transcript:
                             speaker = str(entry.speaker or "Unknown")
                             initials = "".join(part[0] for part in speaker.split()[:2]).upper() or "?"
-                            timestamp = f'<span class="transcript-time">{entry.timestamp}</span>' if entry.timestamp else ""
-                            entries.append(f'<div class="transcript-entry"><div class="speaker-avatar">{initials}</div><div><div class="transcript-speaker">{speaker}{timestamp}</div><div class="transcript-text">{entry.text}</div></div></div>')
+                            timestamp = f'<span class="transcript-time">{escape(str(entry.timestamp))}</span>' if entry.timestamp else ""
+                            entries.append(f'<div class="transcript-entry"><div class="speaker-avatar">{escape(initials)}</div><div><div class="transcript-speaker">{escape(speaker)}{timestamp}</div><div class="transcript-text">{escape(str(entry.text))}</div></div></div>')
                         st.markdown("".join(entries), unsafe_allow_html=True)
                     else:
                         st.info("No transcript lines were returned.")
