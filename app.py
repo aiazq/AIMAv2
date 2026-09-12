@@ -1,5 +1,6 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import datetime
 import io
 import json
@@ -10,8 +11,9 @@ import time
 import httpx
 import streamlit as st
 from docx import Document
+from docx.oxml.ns import qn
 from docxtpl import DocxTemplate
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # -----------------------------------------------------------------------------
 # Configuration & Styling
@@ -157,7 +159,21 @@ class ActionItem(BaseModel):
     owner: str = Field(description="Person, role, or team assigned to this task.")
     department: str = Field(default="", description="Relevant department or team if identifiable.")
     deadline: str = Field(description="Due date, timeframe, or 'TBD' if unspecified.")
-    priority: str = Field(description="High, Medium, Low, or remarks.")
+    remarks: str = Field(
+        default="",
+        description="Priority (High/Medium/Low) and any other remarks for this item.",
+    )
+
+    @field_validator("remarks", mode="before")
+    @classmethod
+    def _accept_legacy_priority(cls, v, info):
+        """Accept the legacy 'priority' field name as an alias for 'remarks' (D13)."""
+        if v is None:
+            data = info.data if hasattr(info, "data") else {}
+            return data.get("priority", "") or ""
+        return v
+
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
 
 class TranscriptEntry(BaseModel):
@@ -293,6 +309,9 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
+            # Gateways that stream by default (9router/LiteLLM/vLLM proxies) return
+            # text/event-stream here, which breaks res.json(). Be explicit.
+            "stream": False,
             "temperature": 0.1,
         }
 
@@ -301,6 +320,12 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
 
     if res.status_code != 200:
         raise RuntimeError(f"HTTP {res.status_code} from provider: {res.text}")
+
+    if not (res.headers.get("content-type") or "").lower().startswith("application/json"):
+        raise RuntimeError(
+            "Provider returned a non-JSON response "
+            f"(content-type={res.headers.get('content-type')!r}): {res.text[:300]}"
+        )
 
     res_json = res.json()
     if "candidates" in res_json:
@@ -324,6 +349,11 @@ def call_llm_json(endpoint_base: str, api_key: str, model_name: str, prompt: str
 # Fail-Safe Template Generation Engine
 # -----------------------------------------------------------------------------
 def build_document_skeleton(doc: Document) -> dict:
+    """Describe the document to the classifier.
+
+    Table cell text is included via the tables' own header/preview fields so the
+    model sees the whole document, not just loose body paragraphs (D9).
+    """
     paragraphs_meta = []
     for idx, p in enumerate(doc.paragraphs):
         full_text = "".join(r.text for r in p.runs).strip()
@@ -352,30 +382,228 @@ def build_document_skeleton(doc: Document) -> dict:
     return {"paragraphs": paragraphs_meta, "tables": tables_meta}
 
 
-def set_cell_clean(cell, text: str):
-    """Replaces cell contents with a single run without split XML tags."""
+# -----------------------------------------------------------------------------
+# Deterministic table assembler
+# -----------------------------------------------------------------------------
+# Header keyword -> logical field. Order matters: first match wins, so more
+# specific patterns must come first. The special field "@index" becomes the
+# row number (loop.index); any other value becomes "<loopvar>.<field>".
+_COLUMN_KEYWORDS = [
+    # row number
+    (("sr", "s.#", "s/n", "sno", "no.", "number", "serial", "#"), "@index"),
+    # attendee columns
+    (("designation", "role", "title", "position", "desig", "rank"), "designation"),
+    (("name", "participant", "attendee", "person", "member"), "name"),
+    # action-item columns
+    (("agenda", "topic", "discussion", "subject", "point"), "topic"),
+    (("action", "ap", "task", "activity", "description", "work"), "task"),
+    (("owner", "responsible", "resp", "assigned", "assignee", "who"), "owner"),
+    (("department", "dept", "division", "section", "unit"), "department"),
+    (("deadline", "dead line", "due", "date", "timeline", "target"), "deadline"),
+    (("remark", "comment", "note", "status", "priority"), "remarks"),
+]
+
+# Which fields are meaningful for each table type. Anything else is not mapped.
+_TABLE_FIELDS = {
+    "ATTENDEES_TABLE": {"@index", "name", "designation"},
+    "ACTION_ITEMS_TABLE": {"@index", "topic", "task", "owner", "department",
+                           "deadline", "remarks"},
+}
+
+
+def _norm_header(text: str) -> str:
+    return re.sub(r"[^a-z0-9.#/ ]+", "", (text or "").lower()).strip()
+
+
+def map_header_to_variable(header: str, table_type: str) -> str | None:
+    """Map a column header to a logical field by KEYWORD, not position (D4).
+
+    Returns None when the column has no known semantic for this table type, so the
+    column is left as a literal rather than being silently filled with wrong data.
+    """
+    h = _norm_header(header)
+    if not h:
+        return None
+    allowed = _TABLE_FIELDS.get(table_type)
+    if allowed is None:
+        return None
+    for keys, field in _COLUMN_KEYWORDS:
+        if field not in allowed:
+            continue
+        for k in keys:
+            if k == "#":
+                if h == "#":
+                    return field
+                continue
+            # exact match first, then prefix, then substring
+            if h == k:
+                return field
+        for k in keys:
+            if k == "#":
+                continue
+            if h.startswith(k) or k in h:
+                return field
+    return None
+
+
+def _clear_cell_keep_format(cell):
+    """Empty a cell but keep its first run (and therefore its run properties)."""
     p = cell.paragraphs[0]
-    p.text = ""
-    for extra_p in cell.paragraphs[1:]:
-        p_elem = extra_p._p
-        if p_elem.getparent() is not None:
-            p_elem.getparent().remove(p_elem)
-    p.add_run(text)
+    runs = list(p.runs)
+    if runs:
+        runs[0].text = ""
+        for r in runs[1:]:
+            r._element.getparent().remove(r._element)
+    for extra in cell.paragraphs[1:]:
+        extra._p.getparent().remove(extra._p)
+
+
+def set_cell_clean(cell, text: str):
+    """Replace a cell's contents with `text`, preserving the first run's formatting.
+
+    Keeps run count at 1 so docxtpl never sees a Jinja token split across runs (D1).
+    """
+    p = cell.paragraphs[0]
+    runs = list(p.runs)
+    if runs:
+        runs[0].text = text
+        for r in runs[1:]:
+            r._element.getparent().remove(r._element)
+    else:
+        p.add_run(text)
+    for extra in cell.paragraphs[1:]:
+        extra._p.getparent().remove(extra._p)
+
+
+def _prototype_data_row(table, header_rows_count: int):
+    """Deepcopy a sample data row so generated rows inherit the client's styling (D6)."""
+    if len(table.rows) > header_rows_count:
+        return copy.deepcopy(table.rows[-1]._tr)
+    return copy.deepcopy(table.rows[-1]._tr)
+
+
+def build_table_row_loop(table, header_rows_count: int, var_name: str,
+                         table_type: str, collection: str = None) -> list[str]:
+    """Convert a sample table into a docxtpl row loop.
+
+    Layout produced:  header... | for-row | template-row | endfor-row
+
+    docxtpl requires `{%tr for %}` and `{%tr endfor %}` to each occupy their OWN
+    row: patch_xml collapses an entire <w:tr> into a single Jinja line, so putting
+    both tags in the same row swallows the intervening cells and yields a bare,
+    invalid `endfor` (D1).
+
+    Column mapping is by header keyword (D4). Columns with no known semantic are
+    left empty rather than being filled with the wrong data.
+
+    `collection` is the context key iterated over (e.g. "action_items"); it may
+    differ from `var_name` (e.g. "item"), so it must be passed explicitly.
+
+    Returns the list of variables actually placed (used for validation/logging).
+    """
+    collection = collection or (var_name + "s")
+    if header_rows_count < 1:
+        header_rows_count = 1
+    if header_rows_count >= len(table.rows):
+        raise ValueError(
+            f"table has {len(table.rows)} rows but header_rows_count="
+            f"{header_rows_count}; nothing left to convert"
+        )
+
+    proto_tr = _prototype_data_row(table, header_rows_count)
+
+    # 1) keep only the header rows
+    while len(table.rows) > header_rows_count:
+        tr = table.rows[-1]._tr
+        tr.getparent().remove(tr)
+
+    # 2) append three cloned rows (for / template / endfor)
+    anchor = table.rows[-1]._tr
+    for _ in range(3):
+        nt = copy.deepcopy(proto_tr)
+        anchor.addnext(nt)
+        anchor = nt
+
+    rows = list(table.rows)
+    for_row, tpl_row, end_row = rows[-3], rows[-2], rows[-1]
+    header_cells = rows[0].cells
+
+    # 3) map each column by header keyword, de-duplicating
+    mapping = {}
+    for ci, hc in enumerate(header_cells):
+        field = map_header_to_variable(hc.text, table_type)
+        if field and field not in mapping.values():
+            mapping[ci] = field
+
+    if not mapping:
+        raise ValueError(
+            "no column could be mapped to a template variable; headers="
+            + repr([c.text for c in header_cells])
+        )
+
+    # 4) for-row: opening tag alone
+    for c in for_row.cells:
+        _clear_cell_keep_format(c)
+    set_cell_clean(for_row.cells[0], f"{{%tr for {var_name} in {collection} %}}")
+
+    # 5) template row
+    for c in tpl_row.cells:
+        _clear_cell_keep_format(c)
+    placed = []
+    for ci, field in mapping.items():
+        if ci >= len(tpl_row.cells):
+            continue
+        expr = "loop.index" if field == "@index" else "%s.%s" % (var_name, field)
+        set_cell_clean(tpl_row.cells[ci], "{{ %s }}" % expr)
+        placed.append(expr)
+
+    # 6) endfor-row: closing tag alone
+    for c in end_row.cells:
+        _clear_cell_keep_format(c)
+    set_cell_clean(end_row.cells[0], "{%tr endfor %}")
+
+    return placed
+
+
+def clear_sample_rows(table, header_rows_count: int):
+    """Remove leftover sample data rows from a STATIC table so client dummy data
+    does not ship into every generated document (D5)."""
+    if header_rows_count < 1:
+        header_rows_count = 1
+    while len(table.rows) > header_rows_count:
+        tr = table.rows[-1]._tr
+        tr.getparent().remove(tr)
 
 
 def purge_rogue_jinja_tags(doc: Document):
-    """Scours all paragraphs and strips any stray block loop tags that break docxtpl."""
-    for p in doc.paragraphs:
+    """Strip stray block loop tags that break docxtpl.
+
+    Scans BODY PARAGRAPHS AND TABLE CELLS - the previous version only walked
+    doc.paragraphs, so rogue tags inside table cells survived into the template (D10).
+    """
+    def clean_paragraph(p):
         full = "".join(r.text for r in p.runs)
-        # If there's an unclosed or orphaned endfor/for in paragraphs, strip it
-        if "{% for" in full or "{% endfor" in full or "{%tr" in full:
-            cleaned = re.sub(r"\{%(?:tr)?\s*(?:for.*?|endfor)\s*%\}", "", full).strip()
-            for r in p.runs:
-                r.text = ""
-            if p.runs:
-                p.runs[0].text = cleaned
-            else:
-                p.add_run(cleaned)
+        if not full:
+            return
+        if "{%" in full and ("for" in full or "endfor" in full):
+            cleaned = re.sub(
+                r"\{%(?:tr|tc|p|r)?\s*(?:for\b.*?|endfor)\s*%\}", "", full
+            ).strip()
+            if cleaned == full:
+                return
+            runs = list(p.runs)
+            if runs:
+                runs[0].text = cleaned
+                for r in runs[1:]:
+                    r._element.getparent().remove(r._element)
+
+    for p in doc.paragraphs:
+        clean_paragraph(p)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    clean_paragraph(p)
 
 
 def generate_template_from_sample_ai(
@@ -403,8 +631,12 @@ AVAILABLE VARIABLES:
 - date: str
 - meeting_time: str
 - minute_taker: str
+- executive_summary: str
+- agenda_and_decisions: list[{{topic: str, discussion_summary: str, decisions_made: list[str]}}]
 - attendees: list[{{name: str, designation: str}}]
 - action_items: list[{{task: str, owner: str, department: str, deadline: str, remarks: str}}]
+- detected_speakers: list[{{speaker_id: str, inferred_name: str}}]
+- transcript: list[{{speaker: str, timestamp: str, original_text: str, translated_text: str}}]
 - next_meeting_date: str
 - next_meeting_time: str
 - next_meeting_agenda_focus: str
@@ -473,58 +705,53 @@ Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
         if p_elem.getparent() is not None:
             p_elem.getparent().remove(p_elem)
 
-    # 2. Mutate Tables (Controlled & deterministic row-loop generation)
+    # 2. Purge stray jinja tags left in the SAMPLE (body + cells).
+    #    This MUST run before the row loops are generated below, otherwise it would
+    #    strip the `{%tr for %}` / `{%tr endfor %}` tags we are about to create.
+    purge_rogue_jinja_tags(doc)
+
+    # 3. Mutate Tables (deterministic row-loop generation)
+    loop_specs = {
+        "ATTENDEES_TABLE": ("attendee", "attendees"),
+        "ACTION_ITEMS_TABLE": ("item", "action_items"),
+    }
+    conversion_notes = []
+
     for t_idx, table in enumerate(doc.tables):
         tid = f"t_{t_idx}"
         rule = t_map.get(tid)
         if not rule:
             continue
 
-        if rule.table_type in ["ATTENDEES_TABLE", "ACTION_ITEMS_TABLE"]:
-            # Delete sample dummy data rows
-            while len(table.rows) > rule.header_rows_count:
-                row = table.rows[-1]
-                tr = row._tr
-                tr.getparent().remove(tr)
+        ttype = rule.table_type
 
-            new_row = table.add_row()
-            cols_count = len(new_row.cells)
+        # Tolerate alternate spellings the model may emit.
+        if ttype in ("ACTION_TABLE", "ACTION_ITEMS", "ACTIONITEMS_TABLE"):
+            ttype = "ACTION_ITEMS_TABLE"
+        if ttype in ("ATTENDEES", "ATTENDEE_TABLE", "PARTICIPANTS_TABLE"):
+            ttype = "ATTENDEES_TABLE"
 
-            if rule.table_type == "ATTENDEES_TABLE":
-                # Strict, guaranteed docxtpl row loop
-                if cols_count == 3:
-                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ loop.index }}")
-                    set_cell_clean(new_row.cells[1], "{{ a.name }}")
-                    set_cell_clean(new_row.cells[2], "{{ a.designation }}{%tr endfor %}")
-                elif cols_count == 2:
-                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ a.name }}")
-                    set_cell_clean(new_row.cells[1], "{{ a.designation }}{%tr endfor %}")
-                else:
-                    set_cell_clean(new_row.cells[0], "{%tr for a in attendees %}{{ a.name }}")
-                    set_cell_clean(new_row.cells[-1], "{{ a.designation }}{%tr endfor %}")
+        if ttype in ("ATTENDEES_TABLE", "ACTION_ITEMS_TABLE"):
+            var_name, collection = loop_specs[ttype]
+            try:
+                placed = build_table_row_loop(
+                    table, rule.header_rows_count, var_name, ttype, collection
+                )
+                conversion_notes.append(
+                    f"{tid} ({ttype}): mapped {len(placed)} columns -> {', '.join(placed)}"
+                )
+            except ValueError as tbl_err:
+                # Loud failure beats a silently blank table (D3).
+                raise ValueError(f"Table {tid} ({ttype}) could not be converted: {tbl_err}")
 
-            elif rule.table_type == "ACTION_ITEMS_TABLE":
-                # Strict, guaranteed docxtpl row loop matching your sample's 6 columns
-                if cols_count >= 6:
-                    set_cell_clean(new_row.cells[0], "{%tr for item in action_items %}{{ loop.index }}")
-                    set_cell_clean(new_row.cells[1], "{{ item.task }}")
-                    set_cell_clean(new_row.cells[2], "{{ item.owner }}")
-                    set_cell_clean(new_row.cells[3], "{{ item.department }}")
-                    set_cell_clean(new_row.cells[4], "{{ item.deadline }}")
-                    set_cell_clean(new_row.cells[5], "{{ item.remarks }}{%tr endfor %}")
-                elif cols_count >= 4:
-                    set_cell_clean(new_row.cells[0], "{%tr for item in action_items %}{{ item.task }}")
-                    set_cell_clean(new_row.cells[1], "{{ item.owner }}")
-                    set_cell_clean(new_row.cells[2], "{{ item.deadline }}")
-                    set_cell_clean(new_row.cells[-1], "{{ item.remarks }}{%tr endfor %}")
+        elif ttype == "STATIC_TABLE":
+            # Keep the layout, drop the client's sample data rows (D5).
+            clear_sample_rows(table, rule.header_rows_count)
 
-        elif rule.table_type == "PURGE":
+        elif ttype == "PURGE":
             tbl = table._tbl
             if tbl.getparent() is not None:
                 tbl.getparent().remove(tbl)
-
-    # 3. Purge any stray rogue jinja tags from paragraphs
-    purge_rogue_jinja_tags(doc)
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -533,25 +760,42 @@ Return pure valid JSON conforming strictly to the DocumentAnalysisPlan schema:
     # Self-Testing Compilation: verifies template before handing to user
     try:
         test_tpl = DocxTemplate(io.BytesIO(template_bytes))
-        test_ctx = {
-            "title": "Test",
-            "date": "2026-09-12",
-            "meeting_time": "",
-            "minute_taker": "",
-            "attendees": [{"name": "Test User", "designation": "CEO"}],
-            "action_items": [{"task": "Task", "owner": "Owner", "department": "Admin", "deadline": "TBD", "remarks": ""}],
-            "next_meeting_date": "TBD",
-            "next_meeting_time": "TBD",
-            "next_meeting_agenda_focus": "",
-            "closing_remarks": "",
-        }
-        test_tpl.render(test_ctx)
+        test_ctx = _build_render_context(
+            {
+                "title": "Test",
+                "date": "2026-09-12",
+                "meeting_time": "10:00",
+                "minute_taker": "Test Taker",
+                "executive_summary": "Test summary",
+                "agenda_and_decisions": [
+                    {"topic": "Test Topic", "discussion_summary": "Test discussion",
+                     "decisions_made": ["Decision 1"]},
+                ],
+                "attendees": [{"name": "Test User", "designation": "CEO"}],
+                "detected_speakers": [{"speaker_id": "Speaker 1", "inferred_name": "Test User"}],
+                "action_items": [
+                    {"task": "Task", "owner": "Owner", "department": "Admin",
+                     "deadline": "TBD", "remarks": ""},
+                ],
+                "transcript": [
+                    {"speaker": "Test User", "timestamp": "00:01",
+                     "original_text": "Hello", "translated_text": "Hello"},
+                ],
+                "next_meeting_date": "TBD",
+                "next_meeting_time": "TBD",
+                "next_meeting_agenda_focus": "TBD",
+                "closing_remarks": "Test closing",
+            }
+        )
+        # autoescape=True must match the production render, or the validator
+        # cannot catch the special-character corruption (D11/D12).
+        test_tpl.render(test_ctx, autoescape=True)
         if status_container:
             status_container.success("Template verified and compiled successfully!")
     except Exception as validation_err:
         if status_container:
             status_container.error(f"Template compilation failed during self-test: {validation_err}")
-        raise validation_err
+        raise
 
     return io.BytesIO(template_bytes)
 
@@ -564,29 +808,38 @@ class _AttendeeView(dict):
         return f"{name} ({desig})" if desig else name
 
 
-def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
-    doc = DocxTemplate(io.BytesIO(template_bytes))
-    context = data.model_dump()
-
+def _build_render_context(context: dict) -> dict:
+    """Normalize a render context for docxtpl. Shared by production and self-test so
+    the validator exercises the same shapes real data takes (D12)."""
     # Attendees Normalization
     normalized_attendees = []
-    for a in context.get("attendees", []):
+    for a in context.get("attendees", []) or []:
         if isinstance(a, dict):
             normalized_attendees.append(_AttendeeView(a))
         else:
             normalized_attendees.append(_AttendeeView({"name": str(a), "designation": ""}))
     context["attendees"] = normalized_attendees
 
-    # Action Items Normalization (alias remarks and priority)
-    for item in context.get("action_items", []):
-        if "remarks" not in item or not item["remarks"]:
-            item["remarks"] = item.get("priority", "")
+    # Action Items Normalization (legacy 'priority' -> remarks)
+    for item in context.get("action_items", []) or []:
+        if not item.get("remarks"):
+            item["remarks"] = item.get("priority", "") or ""
 
     # Transcript Aliasing
-    for item in context.get("transcript", []):
+    for item in context.get("transcript", []) or []:
         item["text"] = item.get("translated_text") or item.get("original_text", "")
 
-    doc.render(context)
+    return context
+
+
+def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
+    doc = DocxTemplate(io.BytesIO(template_bytes))
+    context = _build_render_context(data.model_dump())
+
+    # autoescape=True is REQUIRED: with docxtpl's default (False), user data
+    # containing '&', '<' or '>' is silently mangled or dropped, producing invalid
+    # or lossy XML. E.g. 'Sarhad Chamber & ISO 14001' -> 'Sarhad Chamber  ISO 14001' (D11).
+    doc.render(context, autoescape=True)
     out_stream = io.BytesIO()
     doc.save(out_stream)
     out_stream.seek(0)
@@ -647,7 +900,7 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
             row_cells[1].text = ai.owner
             row_cells[2].text = ai.department
             row_cells[3].text = ai.deadline
-            row_cells[4].text = ai.priority
+            row_cells[4].text = ai.remarks
 
     doc.add_heading("5. Speaker-Diarized Transcript (English)", level=1)
     for entry in data.transcript:
@@ -762,6 +1015,10 @@ def analyze_meeting_audio_rest(
                 }
             ],
             "response_format": {"type": "json_object"},
+            # Several OpenAI-compatible gateways (9router, LiteLLM, vLLM proxies)
+            # stream by DEFAULT, which returns text/event-stream and breaks
+            # response.json(). Ask for a single JSON body explicitly.
+            "stream": False,
             "temperature": 0.2,
         }
 

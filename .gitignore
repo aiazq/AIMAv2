@@ -1,0 +1,24 @@
+# ---- secrets / credentials -------------------------------------------------
+.env
+*.key
+*.kdbx
+
+# ---- python ----------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- PRIVATE FIXTURES — never commit ---------------------------------------
+# Real client meeting minutes. The golden suite falls back to a synthetic
+# sample (tests/make_synthetic_sample.py) so it still runs without these.
+samples/
+private_fixtures/
+tests/sample_synthetic.docx
+
+# ---- misc ------------------------------------------------------------------
+.DS_Store
+*.log
+PLAN.md
+repro/
