@@ -156,7 +156,7 @@ class ActionItem(BaseModel):
     owner: str = Field(description="Person, role, or team assigned to this task.")
     department: str = Field(default="", description="Relevant department or team if identifiable.")
     deadline: str = Field(description="Due date, timeframe, or 'TBD' if unspecified.")
-    priority: str = Field(description="High, Medium, Low, or key remarks.")
+    priority: str = Field(description="High, Medium, Low, or remarks.")
 
 
 class TranscriptEntry(BaseModel):
@@ -395,7 +395,7 @@ AVAILABLE DATA CONTEXT FOR RENDERING:
 - attendees: list[{{name: str, designation: str}}]
 - executive_summary: str
 - agenda_and_decisions: list[{{topic: str, discussion_summary: str, decisions_made: list[str]}}]
-- action_items: list[{{task: str, owner: str, department: str, deadline: str, priority: str}}]
+- action_items: list[{{task: str, owner: str, department: str, deadline: str, priority: str, remarks: str}}]
 - next_meeting_date: str
 - next_meeting_time: str
 - next_meeting_agenda_focus: str
@@ -411,7 +411,7 @@ UNIVERSAL DECONSTRUCTION RULES:
    - If a table contains action items, agenda points, or tasks:
      action = 'TRANSFORM_LOOP', header_rows_count = 1, loop_target_entity = 'action_items'.
      cell_jinja_expressions must match table column count, e.g.:
-     ['{{%tr for item in action_items %}}{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.priority }}}}{{%tr endfor %}}']
+     ['{{%tr for item in action_items %}}{{{{ loop.index }}}}', '{{{{ item.task }}}}', '{{{{ item.owner }}}}', '{{{{ item.department }}}}', '{{{{ item.deadline }}}}', '{{{{ item.remarks }}}}{{%tr endfor %}}']
    - Tables with key-value pairs or signatures: action = 'KEEP_STATIC'.
 2. Paragraphs:
    - Section headers (e.g. 'ATTENDEES', 'Agenda Points:', '3. NEXT MEETING', '4. CLOSING'): action = 'KEEP_STATIC'.
@@ -493,6 +493,14 @@ Return pure valid JSON conforming strictly to the UniversalTemplatePlan schema:
     return out_stream
 
 
+class _AttendeeView(dict):
+    """Allows dictionary to be rendered as both an object (a.name) and string ({{ a }})."""
+    def __str__(self):
+        name = self.get("name", "")
+        desig = self.get("designation", "")
+        return f"{name} ({desig})" if desig else name
+
+
 def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
@@ -501,11 +509,17 @@ def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> i
     normalized_attendees = []
     for a in context.get("attendees", []):
         if isinstance(a, dict):
-            normalized_attendees.append(a)
+            normalized_attendees.append(_AttendeeView(a))
         else:
-            normalized_attendees.append({"name": str(a), "designation": ""})
+            normalized_attendees.append(_AttendeeView({"name": str(a), "designation": ""}))
     context["attendees"] = normalized_attendees
 
+    # Action Items Aliasing (remarks <-> priority)
+    for item in context.get("action_items", []):
+        if "remarks" not in item or not item["remarks"]:
+            item["remarks"] = item.get("priority", "")
+
+    # Transcript Aliasing
     for item in context.get("transcript", []):
         item["text"] = item.get("translated_text") or item.get("original_text", "")
 
@@ -562,7 +576,7 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
         hdr[1].text = "Owner"
         hdr[2].text = "Department"
         hdr[3].text = "Deadline"
-        hdr[4].text = "Priority"
+        hdr[4].text = "Remarks / Priority"
 
         for ai in data.action_items:
             row_cells = table.add_row().cells
@@ -1074,22 +1088,28 @@ def main():
             result: MeetingMinutesReport = st.session_state["meeting_result"]
             active_template = st.session_state.get("saved_template_bytes")
 
-            t_col1, t_col2 = st.columns([0.7, 0.3])
+            t_col1, t_col2 = st.columns([0.65, 0.35])
             with t_col1:
                 st.markdown(f"## {result.title}")
                 attendee_names = [a.name for a in result.attendees]
                 st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(attendee_names)}")
             with t_col2:
+                template_used = False
                 if active_template:
                     try:
                         doc_io = render_template_docx(active_template, result)
-                    except Exception:
+                        template_used = True
+                    except Exception as ex:
+                        st.warning(f"⚠️ Template rendering issue: {ex}. Using clean layout.")
                         doc_io = build_default_docx(result)
+                        template_used = False
                 else:
                     doc_io = build_default_docx(result)
+                    template_used = False
 
+                download_label = "📥 Download Filled Template (.docx)" if template_used else "📥 Download Standard .docx"
                 st.download_button(
-                    label="📥 Download .docx",
+                    label=download_label,
                     data=doc_io,
                     file_name=f"{result.title.replace(' ', '_')}_Minutes.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
