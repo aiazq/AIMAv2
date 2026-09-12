@@ -1,13 +1,12 @@
+import base64
 import io
 import json
 import os
-import tempfile
 import time
+import httpx
 import streamlit as st
 from docx import Document
 from docxtpl import DocxTemplate
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
@@ -19,19 +18,20 @@ st.set_page_config(
     layout="wide",
 )
 
-# Secrets & Defaults Initialization
-DEFAULT_MODEL = "gemini-3.6-flash"
-SECRET_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
+# Default complete endpoint URL and model
+DEFAULT_ENDPOINT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
+SECRET_ENDPOINT = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_ENDPOINT_URL))
 
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = SECRET_KEY
 
-if "model_name" not in st.session_state:
-    st.session_state["model_name"] = DEFAULT_MODEL
+if "endpoint_url" not in st.session_state:
+    st.session_state["endpoint_url"] = SECRET_ENDPOINT
 
 
 # -----------------------------------------------------------------------------
-# Pydantic Schemas for Structured JSON Output
+# Pydantic Schemas for Structured Output
 # -----------------------------------------------------------------------------
 class ActionItem(BaseModel):
     task: str = Field(description="Description of the action item or task.")
@@ -63,70 +63,130 @@ class MeetingMinutesReport(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Gemini Audio Analysis with Progress Indicator
+# Universal API Dispatcher (Google Gemini REST & OpenAI-Compatible Audio Chat)
 # -----------------------------------------------------------------------------
-def analyze_meeting_audio(
+def analyze_meeting_audio_rest(
     audio_file_bytes: bytes,
     mime_type: str,
     api_key: str,
-    model_name: str,
+    endpoint_url: str,
     progress_bar,
     status_text,
 ) -> MeetingMinutesReport:
-    client = genai.Client(api_key=api_key)
-
-    status_text.text("Step 1/3: Uploading audio buffer to Gemini File API...")
+    """Dispatches audio to the designated complete endpoint URL."""
+    status_text.text("Step 1/3: Encoding audio buffer...")
     progress_bar.progress(20)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix="." + mime_type.split("/")[-1]) as tmp:
-        tmp.write(audio_file_bytes)
-        tmp_path = tmp.name
+    b64_audio = base64.b64encode(audio_file_bytes).decode("utf-8")
+    progress_bar.progress(40)
 
-    try:
-        uploaded_file = client.files.upload(file=tmp_path)
-        progress_bar.progress(45)
+    prompt = (
+        "You are an executive meeting assistant. Listen carefully to this meeting audio recording:\n"
+        "1. Produce a full diarized transcript identifying distinct speakers.\n"
+        "2. Generate an executive summary.\n"
+        "3. List all topics and decisions made.\n"
+        "4. Extract all action items with owners, deadlines, and priorities.\n"
+        "Return the output as pure valid JSON conforming strictly to this structure:\n"
+        + json.dumps(MeetingMinutesReport.model_json_schema())
+    )
 
-        status_text.text(f"Step 2/3: Transcribing and diarizing speakers via {model_name}...")
-        prompt = """
-        You are an expert executive meeting assistant. Listen carefully to this meeting audio recording and:
-        1. Produce a full transcript with speaker diarization (e.g., Speaker 1, or real names if introduced).
-        2. Generate an executive summary.
-        3. Identify all topics discussed and decisions made.
-        4. Extract all explicit action items with owners, deadlines, and priorities.
-        5. Return strictly valid JSON adhering to the provided schema.
-        """
+    status_text.text(f"Step 2/3: Contacting endpoint ({endpoint_url})...")
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[uploaded_file, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MeetingMinutesReport,
-                temperature=0.2,
-            ),
-        )
+    # Determine protocol based on endpoint structure
+    is_gemini_native = "googleapis.com" in endpoint_url
 
-        progress_bar.progress(85)
-        status_text.text("Step 3/3: Formatting data into structured reports...")
+    if is_gemini_native:
+        # Full Gemini REST payload
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": b64_audio,
+                            }
+                        },
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.2,
+            },
+        }
+    else:
+        # OpenAI-compatible / Custom endpoint payload with input audio
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": b64_audio,
+                                "format": mime_type.split("/")[-1].replace("mpeg", "mp3"),
+                            },
+                        },
+                    ],
+                }
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        }
 
-        result_dict = json.loads(response.text)
-        report = MeetingMinutesReport(**result_dict)
+    with httpx.Client(timeout=300.0) as client:
+        response = client.post(endpoint_url, headers=headers, json=payload)
 
-        progress_bar.progress(100)
-        status_text.text("Analysis Complete!")
-        time.sleep(0.5)
-        return report
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code} from provider: {response.text}")
 
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    progress_bar.progress(85)
+    status_text.text("Step 3/3: Parsing structured meeting minutes...")
+
+    res_json = response.json()
+
+    # Extract raw text depending on provider response layout
+    if "candidates" in res_json:
+        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+    elif "choices" in res_json:
+        raw_text = res_json["choices"][0]["message"]["content"]
+    else:
+        raw_text = json.dumps(res_json)
+
+    # Clean potential markdown fences from non-enforcing endpoints
+    cleaned_json = raw_text.strip()
+    if cleaned_json.startswith("```json"):
+        cleaned_json = cleaned_json[7:]
+    if cleaned_json.startswith("```"):
+        cleaned_json = cleaned_json[3:]
+    if cleaned_json.endswith("```"):
+        cleaned_json = cleaned_json[:-3]
+
+    parsed_data = json.loads(cleaned_json.strip())
+    report = MeetingMinutesReport(**parsed_data)
+
+    progress_bar.progress(100)
+    status_text.text("Processing Complete!")
+    time.sleep(0.5)
+    return report
 
 
 # -----------------------------------------------------------------------------
-# DOCX Sample to Jinja Template Converter
+# DOCX Dynamic Parser and Builders
 # -----------------------------------------------------------------------------
 def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
-    """Scans an existing DOCX sample and converts common sections to Jinja tags."""
     doc = Document(io.BytesIO(sample_bytes))
 
     for p in doc.paragraphs:
@@ -167,9 +227,6 @@ def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
     return out_stream
 
 
-# -----------------------------------------------------------------------------
-# DOCX Document Renderers
-# -----------------------------------------------------------------------------
 def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
@@ -201,7 +258,7 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
     doc.add_heading("3. Action Items", level=1)
     if data.action_items:
         table = doc.add_table(rows=1, cols=4)
-        table.style = "Light Shading Accent 1" if "Light Shading Accent 1" in [s.name for s in doc.styles] else "Table Grid"
+        table.style = "Table Grid"
         hdr_cells = table.rows[0].cells
         hdr_cells[0].text = "Task"
         hdr_cells[1].text = "Owner"
@@ -239,11 +296,11 @@ def main():
 
     with top_col:
         st.title("🎙️ AIMA — AI Meeting Assistant")
-        st.caption("Upload meeting audio to generate diarized transcripts, agendas, and auto-filled Word reports.")
+        st.caption("Custom endpoint meeting assistant: transcripts, action items, and DOCX templates.")
 
     with settings_col:
         with st.popover("⚙️ Settings"):
-            st.markdown("### API & Model Configuration")
+            st.markdown("### Endpoint & Security")
 
             # Scoped CSS to permanently strip password-reveal buttons/eyes across browsers
             st.markdown(
@@ -268,7 +325,7 @@ def main():
             st.caption(f"Status: **{status_indicator}**")
 
             new_key_input = st.text_input(
-                "Update Gemini API Key:",
+                "Update API Key / Bearer Token:",
                 value="",
                 type="password",
                 placeholder="Paste new key to set/replace..." if not has_key else "•••••••••••••••• (Leave blank to keep)",
@@ -279,10 +336,15 @@ def main():
                 st.session_state["api_key"] = new_key_input.strip()
                 st.rerun()
 
-            current_model = st.session_state.get("model_name", DEFAULT_MODEL)
-            new_model = st.text_input("Model Endpoint:", value=current_model)
-            if new_model != current_model:
-                st.session_state["model_name"] = new_model
+            # Complete Endpoint URL Input
+            current_endpoint = st.session_state.get("endpoint_url", DEFAULT_ENDPOINT_URL)
+            new_endpoint = st.text_input(
+                "Complete Meeting Endpoint URL:",
+                value=current_endpoint,
+                help="Enter the full target URL (e.g., [https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions) or your custom proxy/gateway).",
+            )
+            if new_endpoint != current_endpoint:
+                st.session_state["endpoint_url"] = new_endpoint.strip()
 
             st.caption("Settings persist for the active session and are never echoed.")
 
@@ -323,7 +385,7 @@ def main():
                 with st.spinner("Analyzing document structure and creating template..."):
                     try:
                         template_bytes = convert_sample_docx_to_template(sample_file.getvalue()).getvalue()
-                        st.success("Successfully generated a dynamic template from your sample docx!")
+                        st.success("Successfully generated dynamic template from sample!")
                     except Exception as err:
                         st.error(f"Failed to parse sample docx: {err}")
 
@@ -331,10 +393,14 @@ def main():
 
     if st.button("🚀 Process Meeting Audio", type="primary", use_container_width=True):
         active_api_key = st.session_state.get("api_key")
-        active_model = st.session_state.get("model_name", DEFAULT_MODEL)
+        active_endpoint = st.session_state.get("endpoint_url", DEFAULT_ENDPOINT_URL)
 
         if not active_api_key:
-            st.error("Missing Gemini API Key. Open ⚙️ Settings in the top-right corner to provide one.")
+            st.error("Missing API Key. Open ⚙️ Settings in the top-right corner to configure one.")
+            return
+
+        if not active_endpoint:
+            st.error("Missing complete endpoint URL. Check your settings.")
             return
 
         if not audio_file:
@@ -348,13 +414,13 @@ def main():
             audio_bytes = audio_file.read()
             mime = audio_file.type if audio_file.type else "audio/mp3"
 
-            report = analyze_meeting_audio(
-                audio_bytes,
-                mime,
-                active_api_key,
-                active_model,
-                progress_bar,
-                status_text,
+            report = analyze_meeting_audio_rest(
+                audio_bytes=audio_bytes,
+                mime_type=mime,
+                api_key=active_api_key,
+                endpoint_url=active_endpoint,
+                progress_bar=progress_bar,
+                status_text=status_text,
             )
             st.session_state["meeting_result"] = report
             st.session_state["saved_template_bytes"] = template_bytes
