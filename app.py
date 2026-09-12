@@ -33,7 +33,7 @@ st.markdown(
         max-width: 100% !important;
     }
 
-    /* Additional spacing for the settings popover trigger */
+    /* Spacing for the settings popover trigger */
     div[data-testid="stPopover"] {
         margin-top: 0.35rem;
     }
@@ -48,17 +48,12 @@ st.markdown(
         pointer-events: none !important;
     }
 
-    /* Terminal-style log box */
-    .log-box {
-        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-        font-size: 0.82rem;
-        background-color: #0e1117;
-        color: #00ff66;
-        padding: 0.75rem;
+    /* Telemetry cards */
+    div[data-testid="stMetric"] {
+        background-color: var(--secondary-background-color);
+        padding: 0.5rem 0.75rem;
         border-radius: 6px;
-        height: 280px;
-        overflow-y: auto;
-        border: 1px solid #262730;
+        border: 1px solid rgba(128, 128, 128, 0.15);
     }
     </style>
     """,
@@ -91,6 +86,9 @@ if "active_template_bytes" not in st.session_state:
 
 if "logs_list" not in st.session_state:
     st.session_state["logs_list"] = ["[System] Ready. Waiting for user input..."]
+
+if "usage_stats" not in st.session_state:
+    st.session_state["usage_stats"] = None
 
 
 # -----------------------------------------------------------------------------
@@ -182,7 +180,7 @@ def analyze_meeting_audio_rest(
     status_text,
     log_container,
     logs_list,
-) -> MeetingMinutesReport:
+) -> tuple[MeetingMinutesReport, dict]:
     file_size_mb = len(audio_file_bytes) / (1024 * 1024)
     log_event(log_container, logs_list, f"Ingested audio: {file_size_mb:.2f} MB ({mime_type})")
 
@@ -268,11 +266,12 @@ def analyze_meeting_audio_rest(
     req_start = time.time()
     with httpx.Client(timeout=360.0) as client:
         response = client.post(endpoint_url, headers=headers, json=payload)
+    latency = time.time() - req_start
 
     log_event(
         log_container,
         logs_list,
-        f"Provider response: HTTP {response.status_code} in {time.time() - req_start:.2f}s",
+        f"Provider response: HTTP {response.status_code} in {latency:.2f}s",
         level="INFO" if response.status_code == 200 else "ERROR",
     )
 
@@ -280,9 +279,27 @@ def analyze_meeting_audio_rest(
         raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
 
     progress_bar.progress(85)
-    status_text.text("Parsing structured payload...")
+    status_text.text("Parsing structured payload & usage metrics...")
 
     res_json = response.json()
+
+    # Extract Usage Telemetry
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+
+    if "usageMetadata" in res_json:  # Gemini Native
+        usage = res_json["usageMetadata"]
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        completion_tokens = usage.get("candidatesTokenCount", 0)
+        total_tokens = usage.get("totalTokenCount", 0)
+    elif "usage" in res_json:  # OpenAI / Compatible
+        usage = res_json["usage"]
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+
+    # Extract Content
     if "candidates" in res_json:
         raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
     elif "choices" in res_json:
@@ -301,10 +318,26 @@ def analyze_meeting_audio_rest(
     parsed_data = json.loads(cleaned_json.strip())
     report = MeetingMinutesReport(**parsed_data)
 
+    tok_per_sec = (completion_tokens / latency) if latency > 0 and completion_tokens > 0 else 0
+
+    stats = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "latency": latency,
+        "speed": tok_per_sec,
+        "model": model_name,
+    }
+
+    log_event(
+        log_container,
+        logs_list,
+        f"Usage: {total_tokens:,} tokens ({prompt_tokens:,} prompt + {completion_tokens:,} output) | {latency:.2f}s",
+    )
+
     progress_bar.progress(100)
     status_text.text("Processing Complete!")
-    log_event(log_container, logs_list, f"Ready. Extracted {len(report.action_items)} actions and {len(report.transcript)} transcript turns.")
-    return report
+    return report, stats
 
 
 # -----------------------------------------------------------------------------
@@ -455,7 +488,7 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 # Main Application
 # -----------------------------------------------------------------------------
 def main():
-    # Top Header Strip with clean vertical alignment
+    # Top Header Strip
     h_col1, h_col2 = st.columns([0.82, 0.18], vertical_alignment="center")
     with h_col1:
         st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
@@ -490,7 +523,6 @@ def main():
 
             st.markdown("---")
 
-            # Model Selection inside Settings
             models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
             curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
             idx = models_list.index(curr_model) if curr_model in models_list else 0
@@ -507,17 +539,16 @@ def main():
                 )
                 st.rerun()
 
-    # Split Workspace: Left Control & Log Panel vs. Right Document Canvas
+    # Split Workspace
     col_left, col_right = st.columns([0.38, 0.62], gap="large")
 
     # =========================================================================
-    # LEFT PANEL: Controls (Top) + Logging (Bottom)
+    # LEFT PANEL: Controls (Top) + Logging & Telemetry (Bottom)
     # =========================================================================
     with col_left:
         st.markdown("#### 🎛️ Input Controls")
 
         with st.container():
-            # Audio Ingest
             audio_file = st.file_uploader(
                 "Upload Meeting Recording",
                 type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
@@ -526,7 +557,6 @@ def main():
             if audio_file:
                 st.audio(audio_file)
 
-            # Template Selector
             doc_choice = st.radio(
                 "Document Style:",
                 ["Default Executive Layout", "Upload Tagged .docx", "Convert Finished Sample .docx"],
@@ -551,19 +581,28 @@ def main():
                     except Exception as err:
                         st.error(f"Sample parsing failed: {err}")
 
-            # Primary Run Trigger
             run_clicked = st.button("⚡ Process Meeting Recording", type="primary", use_container_width=True)
 
         st.markdown("---")
 
-        # LEFT BOTTOM: Real-time Execution Console
+        # LEFT BOTTOM: Real-time Execution Console & Telemetry
         st.markdown("#### 📟 Execution Console")
         progress_bar = st.progress(0)
         status_text = st.empty()
         log_container = st.empty()
-
-        # Render initial log history
         log_container.code("\n".join(st.session_state["logs_list"]), language="log")
+
+        # Usage Statistics Panel
+        stats = st.session_state.get("usage_stats")
+        if stats:
+            st.markdown("##### 📊 Telemetry & Usage Stats")
+            u_col1, u_col2 = st.columns(2)
+            with u_col1:
+                st.metric("Prompt Tokens", f"{stats['prompt_tokens']:,}")
+                st.metric("Total Tokens", f"{stats['total_tokens']:,}")
+            with u_col2:
+                st.metric("Output Tokens", f"{stats['completion_tokens']:,}")
+                st.metric("Latency", f"{stats['latency']:.2f}s", f"{stats['speed']:.1f} tok/s" if stats['speed'] > 0 else None)
 
         if run_clicked:
             active_key = st.session_state.get("api_key")
@@ -585,7 +624,7 @@ def main():
                 audio_bytes = audio_file.read()
                 mime = audio_file.type if audio_file.type else "audio/mp3"
 
-                report = analyze_meeting_audio_rest(
+                report, usage_metrics = analyze_meeting_audio_rest(
                     audio_file_bytes=audio_bytes,
                     mime_type=mime,
                     api_key=active_key,
@@ -597,6 +636,7 @@ def main():
                     logs_list=st.session_state["logs_list"],
                 )
                 st.session_state["meeting_result"] = report
+                st.session_state["usage_stats"] = usage_metrics
                 st.session_state["saved_template_bytes"] = st.session_state.get("active_template_bytes")
                 st.rerun()
 
@@ -632,7 +672,6 @@ def main():
             result: MeetingMinutesReport = st.session_state["meeting_result"]
             active_template = st.session_state.get("saved_template_bytes")
 
-            # Document Title Bar with Quick Download
             t_col1, t_col2 = st.columns([0.7, 0.3])
             with t_col1:
                 st.markdown(f"## {result.title}")
