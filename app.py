@@ -13,7 +13,7 @@ from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
-# Configuration & Setup
+# Configuration & Styling
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AIMA — AI Meeting Assistant",
@@ -61,14 +61,13 @@ st.markdown(
         color: #d1d5db;
         padding: 0.85rem;
         border-radius: 8px;
-        height: 310px;
+        height: 320px;
         overflow-y: auto;
         border: 1px solid #1f2937;
         line-height: 1.45;
         white-space: pre-wrap;
     }
 
-    /* Smaller, styled quip logs */
     .log-quip {
         font-size: 0.70rem !important;
         color: #94a3b8 !important;
@@ -120,9 +119,15 @@ if "logs_list" not in st.session_state:
 if "usage_stats" not in st.session_state:
     st.session_state["usage_stats"] = None
 
+if "is_processing" not in st.session_state:
+    st.session_state["is_processing"] = False
+
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
+
 
 # -----------------------------------------------------------------------------
-# Quips Registry
+# Quips Collection
 # -----------------------------------------------------------------------------
 FUNNY_QUIPS = [
     "Translating 'per my last email' into diplomatic corporate prose...",
@@ -143,7 +148,7 @@ FUNNY_QUIPS = [
 
 
 # -----------------------------------------------------------------------------
-# Pydantic Schemas
+# Pydantic Schemas (Bilingual Transcription Supported)
 # -----------------------------------------------------------------------------
 class ActionItem(BaseModel):
     task: str = Field(description="Description of the action item or task.")
@@ -155,7 +160,8 @@ class ActionItem(BaseModel):
 class TranscriptEntry(BaseModel):
     speaker: str = Field(description="Name or label of the speaker.")
     timestamp: str = Field(description="Approximate timestamp (e.g., '01:23') or empty string.")
-    text: str = Field(description="Transcribed statement.")
+    original_text: str = Field(description="Speech in original spoken language.")
+    translated_text: str = Field(description="Accurate English translation (same as original if already English).")
 
 
 class AgendaItem(BaseModel):
@@ -177,14 +183,50 @@ class MeetingMinutesReport(BaseModel):
         default_factory=list,
         description="List of detected speakers and any names inferred from introductions or dialog.",
     )
-    executive_summary: str = Field(description="Executive summary of the meeting.")
-    agenda_and_decisions: list[AgendaItem] = Field(description="Topic breakdowns and decisions.")
-    action_items: list[ActionItem] = Field(description="Action items extracted.")
-    transcript: list[TranscriptEntry] = Field(description="Full speaker-diarized transcript.")
+    executive_summary: str = Field(description="Executive summary of the meeting in English.")
+    agenda_and_decisions: list[AgendaItem] = Field(description="Topic breakdowns and decisions in English.")
+    action_items: list[ActionItem] = Field(description="Action items extracted in English.")
+    transcript: list[TranscriptEntry] = Field(description="Bilingual speaker-diarized transcript.")
 
 
 # -----------------------------------------------------------------------------
-# Helpers & Model Discovery
+# Real-time Auto-Scrolling Logger
+# -----------------------------------------------------------------------------
+def log_event(log_container, logs_list, message: str, level: str = "INFO"):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    level_css = {
+        "INFO": "log-info",
+        "DEBUG": "log-debug",
+        "WARN": "log-warn",
+        "ERROR": "log-error",
+        "SUCCESS": "log-success",
+        "QUIP": "log-quip",
+    }.get(level, "log-debug")
+
+    if level == "QUIP":
+        entry = f'<span class="log-quip">[{ts}] 💬 {message}</span>'
+    else:
+        entry = f'<span>[{ts}] <span class="{level_css}">[{level}]</span> {message}</span>'
+
+    logs_list.append(entry)
+
+    # HTML with embedded JavaScript for auto-scroll
+    html_output = f"""
+    <div id="aima-terminal-box" class="terminal-container">
+        {"<br>".join(logs_list)}
+    </div>
+    <script>
+        var terminal = document.getElementById('aima-terminal-box');
+        if (terminal) {{
+            terminal.scrollTop = terminal.scrollHeight;
+        }}
+    </script>
+    """
+    log_container.markdown(html_output, unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# Model Discovery & Inference
 # -----------------------------------------------------------------------------
 def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     cleaned_base = base_url.rstrip("/")
@@ -214,30 +256,6 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
     return [DEFAULT_MODEL]
 
 
-def log_event(log_container, logs_list, message: str, level: str = "INFO"):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    level_css = {
-        "INFO": "log-info",
-        "DEBUG": "log-debug",
-        "WARN": "log-warn",
-        "ERROR": "log-error",
-        "SUCCESS": "log-success",
-        "QUIP": "log-quip",
-    }.get(level, "log-debug")
-
-    if level == "QUIP":
-        entry = f'<span class="log-quip">[{ts}] 💬 {message}</span>'
-    else:
-        entry = f'<span>[{ts}] <span class="{level_css}">[{level}]</span> {message}</span>'
-
-    logs_list.append(entry)
-    html_output = f'<div class="terminal-container">{"<br>".join(logs_list)}</div>'
-    log_container.markdown(html_output, unsafe_allow_html=True)
-
-
-# -----------------------------------------------------------------------------
-# Asynchronous Background Worker & Telemetry
-# -----------------------------------------------------------------------------
 def dispatch_http_request(endpoint_url: str, headers: dict, payload: dict) -> httpx.Response:
     with httpx.Client(timeout=360.0) as client:
         return client.post(endpoint_url, headers=headers, json=payload)
@@ -253,7 +271,8 @@ def analyze_meeting_audio_rest(
     status_text,
     log_container,
     logs_list,
-) -> tuple[MeetingMinutesReport, dict]:
+    stop_button_ph,
+) -> tuple[MeetingMinutesReport | None, dict | None]:
     file_size_mb = len(audio_file_bytes) / (1024 * 1024)
     log_event(log_container, logs_list, f"Ingested raw stream: {file_size_mb:.2f} MB ({mime_type})", "INFO")
 
@@ -269,10 +288,12 @@ def analyze_meeting_audio_rest(
     prompt = (
         "You are an expert executive meeting assistant. Listen carefully to this meeting audio recording:\n"
         "1. Produce a full diarized transcript identifying distinct speakers (e.g., Speaker 1, Speaker 2).\n"
-        "2. Listen for verbal introductions, greetings, or names addressed in conversation to infer the real name of each speaker in 'detected_speakers'.\n"
-        "3. Generate an executive summary.\n"
-        "4. List all topics and decisions made.\n"
-        "5. Extract all action items with owners, deadlines, and priorities.\n"
+        "2. In the transcript, transcribe the speech verbatim in 'original_text' (preserving native language/words), "
+        "and provide an accurate English translation in 'translated_text' (keep identical if already English).\n"
+        "3. Listen for verbal introductions, greetings, or names addressed in conversation to infer the real name of each speaker in 'detected_speakers'.\n"
+        "4. Generate a comprehensive English executive summary.\n"
+        "5. List all topics and decisions made in English.\n"
+        "6. Extract all action items with owners, deadlines, and priorities in English.\n"
         "Return the output as pure valid JSON conforming strictly to this structure:\n"
         + json.dumps(MeetingMinutesReport.model_json_schema())
     )
@@ -336,7 +357,6 @@ def analyze_meeting_audio_rest(
     log_event(log_container, logs_list, f"Dispatching POST request to: {endpoint_url}", "DEBUG")
     progress_bar.progress(35)
 
-    # Launch inference in background thread
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(dispatch_http_request, endpoint_url, headers, payload)
 
@@ -347,17 +367,22 @@ def analyze_meeting_audio_rest(
     last_quip_time = req_start
     pct = 35
 
-    # Interactive polling loop while remote model processes audio
     while not future.done():
+        if stop_button_ph.button("🛑 Stop Processing", key="btn_stop_processing", type="secondary"):
+            st.session_state["stop_requested"] = True
+            log_event(log_container, logs_list, "Execution aborted by user.", "WARN")
+            progress_bar.empty()
+            status_text.warning("Processing stopped.")
+            stop_button_ph.empty()
+            return None, None
+
         time.sleep(1.2)
         elapsed = time.time() - req_start
 
-        # Gradually advance progress bar toward 85%
         if pct < 85:
             pct += 1
             progress_bar.progress(pct)
 
-        # Rotate quip and heartbeat every 7 seconds
         if time.time() - last_quip_time > 7.0:
             current_quip = quip_pool[quip_idx % len(quip_pool)]
             status_text.markdown(f"💬 *{current_quip}*")
@@ -370,6 +395,8 @@ def analyze_meeting_audio_rest(
             )
             quip_idx += 1
             last_quip_time = time.time()
+
+    stop_button_ph.empty()
 
     response = future.result()
     latency = time.time() - req_start
@@ -394,13 +421,13 @@ def analyze_meeting_audio_rest(
     thoughts_tokens = 0
     total_tokens = 0
 
-    if "usageMetadata" in res_json:  # Gemini Native
+    if "usageMetadata" in res_json:
         usage = res_json["usageMetadata"]
         prompt_tokens = usage.get("promptTokenCount", 0)
         completion_tokens = usage.get("candidatesTokenCount", 0)
         thoughts_tokens = usage.get("thoughtsTokenCount", 0)
         total_tokens = usage.get("totalTokenCount", 0)
-    elif "usage" in res_json:  # OpenAI / Compatible
+    elif "usage" in res_json:
         usage = res_json["usage"]
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
@@ -482,23 +509,38 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
 
 
 # -----------------------------------------------------------------------------
-# DOCX Engines
+# Template Creation & Population Engine
 # -----------------------------------------------------------------------------
 def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
+    """Consolidates runs and substitutes structure tags for bulletproof docxtpl rendering."""
     doc = Document(io.BytesIO(sample_bytes))
 
     def replace_keywords_in_paragraph(p):
-        txt = p.text.strip().lower()
-        if not txt:
+        full_text = "".join(r.text for r in p.runs).strip()
+        if not full_text:
             return
-        if any(w in txt for w in ["executive summary", "overview", "background", "summary:"]):
-            p.text = "{{ executive_summary }}"
-        elif any(w in txt for w in ["attendees", "participants", "present:"]):
-            p.text = "Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}"
-        elif any(w in txt for w in ["meeting date", "date:"]):
-            p.text = "Date: {{ date }}"
-        elif any(w in txt for w in ["meeting title", "subject:", "title:"]):
-            p.text = "{{ title }}"
+        low = full_text.lower()
+
+        matched = False
+        target_tag = ""
+
+        if any(w in low for w in ["executive summary", "overview", "background", "summary:"]):
+            target_tag = "{{ executive_summary }}"
+            matched = True
+        elif any(w in low for w in ["attendees", "participants", "present:"]):
+            target_tag = "Attendees: {% for a in attendees %}{{ a }}{% if not loop.last %}, {% endif %}{% endfor %}"
+            matched = True
+        elif any(w in low for w in ["meeting date", "date:"]):
+            target_tag = "Date: {{ date }}"
+            matched = True
+        elif any(w in low for w in ["meeting title", "subject:", "title:"]):
+            target_tag = "{{ title }}"
+            matched = True
+
+        if matched:
+            for r in p.runs:
+                r.text = ""
+            p.runs[0].text = target_tag
 
     for p in doc.paragraphs:
         replace_keywords_in_paragraph(p)
@@ -511,7 +553,7 @@ def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
 
         if len(table.rows) >= 2:
             first_row_txt = " ".join(c.text.lower() for c in table.rows[0].cells)
-            if any(w in first_row_txt for w in ["task", "action", "owner", "assignee", "due"]):
+            if any(w in first_row_txt for w in ["task", "action", "owner", "assignee", "due", "priority"]):
                 while len(table.rows) > 1:
                     row_to_delete = table.rows[-1]
                     tr = row_to_delete._tr
@@ -538,6 +580,9 @@ def convert_sample_docx_to_template(sample_bytes: bytes) -> io.BytesIO:
 def render_template_docx(template_bytes: bytes, data: MeetingMinutesReport) -> io.BytesIO:
     doc = DocxTemplate(io.BytesIO(template_bytes))
     context = data.model_dump()
+    # Provide 'text' field fallback for template backwards compatibility
+    for item in context.get("transcript", []):
+        item["text"] = item.get("translated_text") or item.get("original_text", "")
     doc.render(context)
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -580,13 +625,13 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
             row_cells[2].text = ai.deadline
             row_cells[3].text = ai.priority
 
-    doc.add_heading("4. Speaker-Diarized Transcript", level=1)
+    doc.add_heading("4. Speaker-Diarized Transcript (English)", level=1)
     for entry in data.transcript:
         ts = f"[{entry.timestamp}] " if entry.timestamp else ""
         p = doc.add_paragraph()
         runner = p.add_run(f"{ts}{entry.speaker}: ")
         runner.bold = True
-        p.add_run(entry.text)
+        p.add_run(entry.translated_text)
 
     out_stream = io.BytesIO()
     doc.save(out_stream)
@@ -595,14 +640,30 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 
 
 # -----------------------------------------------------------------------------
-# Main Application
+# Main Application UI
 # -----------------------------------------------------------------------------
 def main():
-    # Top Header Strip
-    h_col1, h_col2 = st.columns([0.82, 0.18], vertical_alignment="center")
+    # Top Header Strip with 'Start Over' Button
+    h_col1, h_col2, h_col3 = st.columns([0.65, 0.18, 0.17], vertical_alignment="center")
     with h_col1:
         st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
     with h_col2:
+        if st.button("🔄 Start Over", use_container_width=True, help="Clear current session and reset all fields"):
+            for k in [
+                "meeting_result",
+                "usage_stats",
+                "saved_template_bytes",
+                "active_template_bytes",
+                "converted_template_download",
+                "logs_list",
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state["logs_list"] = [
+                '<span class="log-debug">[System] Session reset. Ready.</span>'
+            ]
+            st.rerun()
+    with h_col3:
         with st.popover("⚙️ Settings", use_container_width=True):
             st.markdown("**Provider & Model Settings**")
             has_key = bool(st.session_state.get("api_key"))
@@ -619,11 +680,7 @@ def main():
                 st.rerun()
 
             current_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
-            new_base = st.text_input(
-                "Provider Endpoint URL:",
-                value=current_base,
-                help="Base URL without model path",
-            )
+            new_base = st.text_input("Provider Endpoint URL:", value=current_base)
             if new_base != current_base:
                 st.session_state["base_url"] = new_base.strip()
                 st.session_state["available_models"] = fetch_available_models(
@@ -632,7 +689,6 @@ def main():
                 st.rerun()
 
             st.markdown("---")
-
             models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
             curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
             idx = models_list.index(curr_model) if curr_model in models_list else 0
@@ -650,62 +706,82 @@ def main():
                 st.rerun()
 
     # Split Workspace
-    col_left, col_right = st.columns([0.38, 0.62], gap="large")
+    col_left, col_right = st.columns([0.40, 0.60], gap="large")
 
     # =========================================================================
-    # LEFT PANEL: Controls (Top) + Logging & Telemetry (Bottom)
+    # LEFT PANEL: Sequenced Workflow (1, 2, 3) + Telemetry Console
     # =========================================================================
     with col_left:
-        st.markdown("#### 🎛️ Input Controls")
+        st.markdown("#### 1. Upload Audio")
+        audio_file = st.file_uploader(
+            "Select meeting recording",
+            type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
+            help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
+            label_visibility="collapsed",
+        )
+        if audio_file:
+            st.audio(audio_file)
 
-        with st.container():
-            audio_file = st.file_uploader(
-                "Upload Meeting Recording",
-                type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
-                help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
-            )
-            if audio_file:
-                st.audio(audio_file)
+        st.markdown("#### 2. Meeting Document Template")
+        doc_choice = st.radio(
+            "Template strategy:",
+            ["Default Clean Format", "Upload Tagged .docx", "Convert Sample Finished .docx"],
+            horizontal=False,
+            label_visibility="collapsed",
+        )
 
-            doc_choice = st.radio(
-                "Document Style:",
-                ["Default Executive Layout", "Upload Tagged .docx", "Convert Finished Sample .docx"],
-                horizontal=False,
-            )
+        if doc_choice == "Default Clean Format":
+            st.session_state["active_template_bytes"] = None
 
-            if doc_choice == "Default Executive Layout":
-                st.session_state["active_template_bytes"] = None
+        elif doc_choice == "Upload Tagged .docx":
+            uploaded_tpl = st.file_uploader("Upload Word Template (.docx)", type=["docx"], key="tagged_docx")
+            if uploaded_tpl:
+                st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
+                st.caption("✅ Custom Tagged Template Armed")
 
-            elif doc_choice == "Upload Tagged .docx":
-                uploaded_tpl = st.file_uploader("Template (.docx)", type=["docx"], key="tagged_docx")
-                if uploaded_tpl:
-                    st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
+        elif doc_choice == "Convert Sample Finished .docx":
+            sample_file = st.file_uploader("Upload Sample Finished (.docx)", type=["docx"], key="sample_docx")
+            if sample_file:
+                try:
+                    converted_io = convert_sample_docx_to_template(sample_file.getvalue())
+                    converted_bytes = converted_io.getvalue()
+                    st.session_state["active_template_bytes"] = converted_bytes
+                    st.session_state["converted_template_download"] = converted_bytes
 
-            elif doc_choice == "Convert Finished Sample .docx":
-                sample_file = st.file_uploader("Sample Finished (.docx)", type=["docx"], key="sample_docx")
-                if sample_file:
-                    try:
-                        converted_io = convert_sample_docx_to_template(sample_file.getvalue())
-                        st.session_state["active_template_bytes"] = converted_io.getvalue()
-                        st.toast("Template generated from sample!", icon="📄")
-                    except Exception as err:
-                        st.error(f"Sample parsing failed: {err}")
+                    st.success("Template generated from sample!")
+                    st.download_button(
+                        label="📥 Download Generated Template (.docx)",
+                        data=converted_bytes,
+                        file_name="Generated_Meeting_Template.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+                except Exception as err:
+                    st.error(f"Sample parsing failed: {err}")
 
-            run_clicked = st.button("⚡ Process Meeting Recording", type="primary", use_container_width=True)
+        st.markdown("#### 3. Process Meeting Audio")
+        run_col1, run_col2 = st.columns([0.65, 0.35])
+        with run_col1:
+            run_clicked = st.button("⚡ Process Meeting Audio", type="primary", use_container_width=True)
+        with run_col2:
+            stop_ph = st.empty()
 
         st.markdown("---")
 
-        # LEFT BOTTOM: Real-time Execution Console & Telemetry
+        # LEFT BOTTOM: Execution Console
         st.markdown("#### 📟 Execution Console")
         status_text = st.empty()
         progress_bar = st.progress(0)
         log_container = st.empty()
 
-        # Render current log state
-        initial_html = f'<div class="terminal-container">{"<br>".join(st.session_state["logs_list"])}</div>'
+        # Render initial logs
+        initial_html = f"""
+        <div id="aima-terminal-box" class="terminal-container">
+            {"<br>".join(st.session_state["logs_list"])}
+        </div>
+        """
         log_container.markdown(initial_html, unsafe_allow_html=True)
 
-        # Telemetry & Usage Statistics Display
         stats = st.session_state.get("usage_stats")
         if stats:
             st.markdown("##### 📊 Telemetry & Usage Stats")
@@ -743,15 +819,15 @@ def main():
             active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
 
             if not active_key:
-                st.error("Missing API Key. Open ⚙️ Settings in the top header to configure one.")
+                st.error("Missing API Key. Open ⚙️ Settings in header.")
                 return
 
             if not audio_file:
-                st.error("Please upload an audio file first.")
+                st.error("Please upload an audio file in Step 1.")
                 return
 
             st.session_state["logs_list"] = []
-            log_event(log_container, st.session_state["logs_list"], "Starting execution sequence...", "INFO")
+            log_event(log_container, st.session_state["logs_list"], "Execution initialized...", "INFO")
 
             try:
                 audio_bytes = audio_file.read()
@@ -767,16 +843,19 @@ def main():
                     status_text=status_text,
                     log_container=log_container,
                     logs_list=st.session_state["logs_list"],
+                    stop_button_ph=stop_ph,
                 )
-                st.session_state["meeting_result"] = report
-                st.session_state["usage_stats"] = usage_metrics
-                st.session_state["saved_template_bytes"] = st.session_state.get("active_template_bytes")
-                st.rerun()
+
+                if report:
+                    st.session_state["meeting_result"] = report
+                    st.session_state["usage_stats"] = usage_metrics
+                    st.session_state["saved_template_bytes"] = st.session_state.get("active_template_bytes")
+                    st.rerun()
 
             except Exception as e:
                 progress_bar.empty()
                 status_text.empty()
-                log_event(log_container, st.session_state["logs_list"], f"Pipeline failed: {str(e)}", "ERROR")
+                log_event(log_container, st.session_state["logs_list"], f"Execution failed: {str(e)}", "ERROR")
                 st.error(f"Error: {e}")
                 return
 
@@ -785,18 +864,18 @@ def main():
     # =========================================================================
     with col_right:
         if "meeting_result" not in st.session_state:
-            st.info("👈 Upload meeting audio and select your template on the left to generate the minutes document.")
+            st.info("👈 Upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
             st.markdown(
                 """
                 ```
                 +-------------------------------------------------------------+
                 |                    MEETING DOCUMENT VIEWER                  |
                 |                                                             |
-                |  • Executive Summary                                        |
-                |  • Diarized Speaker Identifications & Mapping               |
+                |  • Executive Summary (English)                              |
+                |  • Diarized Speaker Verification & Re-mapping               |
+                |  • Bilingual Transcript (Original Spoken + Translated)      |
                 |  • Action Items Matrix (Owner, Deadline, Priority)          |
-                |  • Full Annotated Transcript                                |
-                |  • Download Ready (.docx)                                   |
+                |  • Dynamic DOCX Generation & Export                         |
                 +-------------------------------------------------------------+
                 ```
                 """
@@ -854,7 +933,7 @@ def main():
                         st.session_state["meeting_result"] = apply_speaker_replacements(result, confirmed_mapping)
                         st.rerun()
 
-            # Structured Content Tabs
+            # Structured Deliverables
             tab_overview, tab_actions, tab_transcript, tab_raw = st.tabs(
                 ["📄 Overview & Agendas", "✅ Action Items", "📝 Diarized Transcript", "🔧 Raw Data"]
             )
@@ -881,10 +960,22 @@ def main():
                     st.info("No action items detected in the discussion.")
 
             with tab_transcript:
-                st.markdown("### Full Dialogue Record")
+                view_mode = st.radio(
+                    "Transcript View Mode:",
+                    ["English Translation", "Original Spoken Language", "Bilingual Side-by-Side"],
+                    horizontal=True,
+                )
+
                 for entry in result.transcript:
                     ts = f"`{entry.timestamp}` " if entry.timestamp else ""
-                    st.markdown(f"{ts}**{entry.speaker}**: {entry.text}")
+                    if view_mode == "English Translation":
+                        st.markdown(f"{ts}**{entry.speaker}**: {entry.translated_text}")
+                    elif view_mode == "Original Spoken Language":
+                        st.markdown(f"{ts}**{entry.speaker}**: {entry.original_text}")
+                    else:
+                        st.markdown(f"{ts}**{entry.speaker}**")
+                        st.markdown(f"- *Original:* {entry.original_text}")
+                        st.markdown(f"- *English:* {entry.translated_text}")
 
             with tab_raw:
                 st.markdown("### Export JSON Metadata")
