@@ -31,13 +31,14 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root,
     .stApp,
     [data-testid="stAppViewContainer"] {
+        /* These are resolved from Streamlit's active theme on the app wrapper,
+           not from the device's OS preference. */
         --aima-bg: var(--background-color, var(--st-color-background, #edf3f8));
         --aima-ink: var(--text-color, var(--st-color-text, #13283f));
         --aima-blue: #2e6ea8;
-        --aima-blue-dark: #1b4b78;
+        --aima-blue-dark: color-mix(in srgb, var(--aima-ink) 72%, #2e6ea8 28%);
         --aima-sky: var(--secondary-background-color, var(--st-color-secondary-background, #e8f2fb));
         --aima-line: color-mix(in srgb, var(--aima-ink) 22%, transparent);
         --aima-panel: var(--secondary-background-color, var(--st-color-secondary-background, #f7fbff));
@@ -47,8 +48,8 @@ st.markdown(
     }
 
     html, body, [data-testid="stAppViewContainer"] {
-        background: var(--aima-bg) !important;
-        color: var(--aima-ink);
+        background: var(--background-color, var(--st-color-background, #edf3f8)) !important;
+        color: var(--text-color, var(--st-color-text, #13283f));
     }
 
     .block-container {
@@ -132,10 +133,10 @@ st.markdown(
     .action-task { color: var(--aima-ink); font-weight: 800; line-height: 1.38; font-size: 0.84rem; }
     .action-meta { color: var(--aima-muted); font-size: 0.71rem; margin-top: 0.26rem; }
     .priority { border-radius: 3px; padding: 0.25rem 0.45rem; font-size: 0.65rem; font-weight: 900; white-space: nowrap; text-transform: uppercase; }
-    .priority-high { color: #9e2f2f; background: #fde6e6; border: 1px solid #efb7b7; }
-    .priority-medium { color: #8d650b; background: #fff4d5; border: 1px solid #ead18a; }
-    .priority-low { color: #24724f; background: #e2f5ea; border: 1px solid #a9d9bc; }
-    .priority-default { color: #526273; background: #edf1f5; border: 1px solid #cad4dd; }
+    .priority-high { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #c96f76; }
+    .priority-medium { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #c7a64b; }
+    .priority-low { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #4eaa7c; }
+    .priority-default { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid var(--aima-line); }
 
     .attendee-card { padding: 0.65rem 0.8rem; margin: 0.4rem 0; background: var(--aima-panel); border: 1px solid var(--aima-line); border-radius: 4px; }
     .attendee-name { color: var(--aima-ink); font-size: 0.84rem; font-weight: 800; }
@@ -167,35 +168,21 @@ st.markdown(
         button[data-baseweb="tab"] { font-size: 0.64rem; padding-left: 0.2rem; padding-right: 0.2rem; }
     }
 
-    /* Streamlit's theme selector varies by release; these selectors cover the
-       app root, body, and inherited theme wrapper when a user selects Dark. */
-    body[data-theme="dark"],
-    [data-theme="dark"],
-    .stApp[data-theme="dark"] {
-        --aima-bg: #0e1117;
-        --aima-ink: #f2f6fa;
-        --aima-blue: #78b9e6;
-        --aima-blue-dark: #a9d7f4;
-        --aima-sky: #1b2b3a;
-        --aima-line: #3b5368;
-        --aima-panel: #182532;
-        --aima-muted: #b0c0cc;
-        --aima-shadow: rgba(0, 0, 0, 0.42);
+
+    /* Keep the two header controls on the same baseline and make Settings a compact icon. */
+    div[data-testid="stHorizontalBlock"]:has(.aima-brand) button {
+        min-height: 2.45rem !important;
+        height: 2.45rem !important;
+        margin-top: 0 !important;
+        line-height: 1 !important;
     }
-
-
-    body[data-theme="dark"] .priority-high,
-    html[data-theme="dark"] .priority-high,
-    [data-theme="dark"] .priority-high { color: #ffc0c0; background: #512d34; border-color: #814852; }
-    body[data-theme="dark"] .priority-medium,
-    html[data-theme="dark"] .priority-medium,
-    [data-theme="dark"] .priority-medium { color: #f5d98b; background: #4d3c1c; border-color: #80682b; }
-    body[data-theme="dark"] .priority-low,
-    html[data-theme="dark"] .priority-low,
-    [data-theme="dark"] .priority-low { color: #9be0b8; background: #1d4638; border-color: #39785e; }
-    body[data-theme="dark"] .priority-default,
-    html[data-theme="dark"] .priority-default,
-    [data-theme="dark"] .priority-default { color: #c2d0da; background: #293744; border-color: #526879; }
+    div[data-testid="stHorizontalBlock"]:has(.aima-brand) div[data-testid="stPopover"] > button {
+        width: 2.45rem !important;
+        min-width: 2.45rem !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        font-size: 1rem !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1680,7 +1667,7 @@ def main():
             st.session_state["logs_list"] = ['<span class="log-debug">[System] Session reset. Ready.</span>']
             st.rerun()
     with h_col3:
-        with st.popover("⚙ Settings", use_container_width=True):
+        with st.popover("⚙", use_container_width=False):
             st.markdown("**Provider & Model Settings**")
             has_key = bool(st.session_state.get("api_key"))
             st.caption(f"Status: {'🟢 Key is Set' if has_key else '🔴 No Key Set'}")
