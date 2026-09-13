@@ -19,9 +19,10 @@ from pydantic import BaseModel, Field, field_validator
 # -----------------------------------------------------------------------------
 # Configuration & Styling
 # -----------------------------------------------------------------------------
+_favicon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "aima_favicon.png")
 st.set_page_config(
     page_title="AIMA — AI Meeting Assistant",
-    page_icon="🎙️",
+    page_icon=_favicon if os.path.exists(_favicon) else "🎙️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -88,10 +89,68 @@ st.markdown(
     .log-warn { color: #fbbf24; }
     .log-error { color: #f87171; }
     .log-success { color: #4ade80; }
+
+    /* Brand mark. The wordmark's "IMA" is dark navy (11,20,35): 18.4:1 on white
+       but 1.02:1 on a dark surface, i.e. invisible. Streamlit defaults the theme
+       to "auto" (follows the OS), so the plate is the thing that keeps the
+       wordmark legible rather than the page background.
+       Light mode: no border, background of the app's own white page -> reads as a
+       clean cut-out instead of a box.
+       Dark mode: the logo's native off-white becomes a deliberate light chip, so
+       it gets a hairline border to look intentional rather than pasted on.
+       Height is pinned so the plate matches the header row (34px art + 5px
+       padding + 1px border = 46px); otherwise it overflows and de-centres. */
+    .aima-brand {
+        display: inline-flex;
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        padding: 5px 12px;
+        box-shadow: none;
+        line-height: 0;
+        margin: 0;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        .aima-brand {
+            background: #f6f7fb;
+            border-color: rgba(255, 255, 255, 0.14);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+        }
+    }
+
+    .aima-brand img {
+        height: 34px;
+        width: auto;
+        display: block;
+    }
+
+    /* Streamlit wraps markdown in a container with its own bottom margin, which
+       drops the plate below the row's vertical centre. Trim it on the header cell. */
+    div[data-testid="stHorizontalBlock"]:has(.aima-brand) div[data-testid="stMarkdownContainer"] {
+        margin: 0 !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def _brand_logo_uri(which: str = "aima_lockup.png") -> str:
+    """Inline data-URI for a brand asset, or "" when the file is absent.
+
+    Base64-embedded rather than served as a static file so it works on Community
+    Cloud with no static-serving config, and so the mark cannot 404 into a broken
+    image icon. Callers fall back to a text title when this returns "".
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", which)
+    try:
+        with open(path, "rb") as fh:
+            return "data:image/png;base64," + base64.b64encode(fh.read()).decode("ascii")
+    except OSError:
+        return ""
+
 
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.6-flash"
@@ -1530,7 +1589,15 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
 def main():
     h_col1, h_col2, h_col3 = st.columns([0.65, 0.18, 0.17], vertical_alignment="center")
     with h_col1:
-        st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
+        _logo = _brand_logo_uri()
+        if _logo:
+            st.markdown(
+                f'<div class="aima-brand"><img src="{_logo}" '
+                f'alt="AIMA — AI Meeting Assistant"></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
     with h_col2:
         if st.button("🔄 Start Over", use_container_width=True, help="Clear session and reset all fields"):
             for k in [
@@ -1754,6 +1821,14 @@ def main():
     # =========================================================================
     with col_right:
         if "meeting_result" not in st.session_state:
+            _wm = _brand_logo_uri()
+            if _wm:
+                st.markdown(
+                    '<div style="text-align:center; padding:1.6rem 0 0.2rem 0;">'
+                    f'<img src="{_wm}" alt="AIMA — AI Meeting Assistant" '
+                    'style="width:172px; max-width:45%; height:auto; opacity:0.55;"></div>',
+                    unsafe_allow_html=True,
+                )
             st.info("👈 Upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
             st.markdown(
                 """

@@ -10,6 +10,7 @@ Asserts the conversion is CORRECT, not merely non-crashing:
 
 Run:  ./.venv/bin/python -m pytest tests/ -q
 """
+import base64
 import copy
 import io
 import json
@@ -866,3 +867,54 @@ def test_purged_and_static_paragraphs_still_work():
     assert "{%p for" not in body, (
         f"an unexpected loop was emitted for ordinary paragraphs: {paras!r}")
 
+
+
+# ---------------------------------------------------------------------------
+# Brand assets
+# ---------------------------------------------------------------------------
+def test_brand_logo_is_embedded_as_a_data_uri():
+    """The header mark must inline as a data-URI so it cannot 404 on Cloud."""
+    uri = app._brand_logo_uri()
+    assert uri.startswith("data:image/png;base64,"), uri[:40]
+    raw = base64.b64decode(uri.split(",", 1)[1])
+    assert len(raw) > 1000, "logo payload suspiciously small"
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+
+
+def test_brand_logo_returns_empty_string_when_asset_missing(monkeypatch):
+    """A missing asset must degrade to the text title, not crash the app."""
+    import builtins
+    real_open = builtins.open
+
+    def boom(path, *a, **k):
+        if str(path).endswith("aima_lockup.png"):
+            raise OSError("simulated missing asset")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", boom)
+    assert app._brand_logo_uri() == ""
+
+
+def test_brand_assets_are_transparent_and_not_white_boxed():
+    """Guards the un-blend step: a baked off-white box would show as a grey tile
+    against the page. Corners must be fully transparent."""
+    from PIL import Image
+
+    p = os.path.join(ROOT, "assets", "aima_lockup.png")
+    assert os.path.exists(p), p
+    with Image.open(p).convert("RGBA") as im:
+        a = im.load()
+        for corner in ((0, 0), (im.width - 1, 0), (0, im.height - 1),
+                       (im.width - 1, im.height - 1)):
+            assert a[corner][3] == 0, (corner, a[corner])
+
+
+def test_favicon_is_square():
+    """Streamlit needs a square-ish icon; a wide lockup gets letterboxed."""
+    from PIL import Image
+
+    fav = os.path.join(ROOT, "assets", "aima_favicon.png")
+    assert os.path.exists(fav), fav
+    with Image.open(fav) as im:
+        assert im.width == im.height, im.size
+        assert im.width >= 128, im.size

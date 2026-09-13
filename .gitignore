@@ -22,3 +22,6 @@ tests/sample_synthetic.docx
 *.log
 PLAN.md
 repro/
+
+# ---- streamlit local secrets (must never be public) ------------------------
+.streamlit/secrets.toml
