@@ -1,7 +1,0 @@
-# External (apt) dependencies for Streamlit Community Cloud.
-# Community Cloud installs these with apt-get on deploy.
-#
-# ffmpeg — required by the live-recording feature. st.audio_input always emits
-# uncompressed WAV, so recordings longer than ~8 minutes are transcoded to MP3
-# before being sent to Gemini (see compress_audio() in app.py).
-ffmpeg

@@ -48,15 +48,6 @@ def install(force: bool = False):
     st.cache_data.return_value = lambda fn: fn
     st.cache_resource.return_value = lambda fn: fn
 
-    # `st.config.get_option(...)` must return a REAL number, not a Mock.
-    # Otherwise `int(st.config.get_option("server.maxUploadSize"))` yields 1 and
-    # any size-cap logic silently computes nonsense under test.
-    _DEFAULTS = {
-        "server.maxUploadSize": 200,
-        "server.maxMessageSize": 200,
-    }
-    st.config.get_option.side_effect = lambda key, *a, **k: _DEFAULTS.get(key, None)
-
     sys.modules["streamlit"] = st
     _INSTALLED = True
     return st

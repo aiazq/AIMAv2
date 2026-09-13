@@ -7,10 +7,6 @@ import json
 import os
 import random
 import re
-import shutil
-import struct
-import subprocess
-import tempfile
 import time
 import httpx
 import streamlit as st
@@ -1289,307 +1285,8 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 
 
 # -----------------------------------------------------------------------------
-# Audio Source Resolution (live recording vs file upload)
+# Audio Pipeline Dispatcher
 # -----------------------------------------------------------------------------
-# Gemini caps a single inline (base64) request at 20 MB TOTAL — prompt included.
-# Everything below reasons about that one number, because on the free Community
-# Cloud tier RAM is the binding constraint, not disk (see NOTES.md).
-INLINE_REQUEST_CAP_MB = 20.0
-_PROMPT_OVERHEAD_MB = 0.2
-
-
-def inline_raw_budget_mb(request_cap_mb: float = INLINE_REQUEST_CAP_MB) -> float:
-    """Largest RAW audio size that still fits inline, after base64 inflation.
-
-    base64 inflates by 4/3 and the JSON body wraps that string once more, so the
-    safe raw budget is (cap - prompt) * 3/4. Currently ~14.85 MB raw.
-    """
-    return max(0.0, (request_cap_mb - _PROMPT_OVERHEAD_MB) * 3.0 / 4.0)
-
-
-def _default_audio_mime(name: str, is_recording: bool) -> str:
-    if is_recording:
-        # st.audio_input always hands back a WAV container.
-        return "audio/wav"
-    ext = (name or "").rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
-    return {
-        "mp3": "audio/mpeg",
-        "wav": "audio/wav",
-        "m4a": "audio/mp4",
-        "mp4": "video/mp4",
-        "ogg": "audio/ogg",
-        "oga": "audio/ogg",
-        "aac": "audio/aac",
-        "flac": "audio/flac",
-        "webm": "audio/webm",
-    }.get(ext, "audio/mpeg")
-
-
-def resolve_audio_source(recording, upload) -> tuple[bytes, str, str] | None:
-    """Pick the audio to process. A fresh take beats a stale upload.
-
-    Returns (raw_bytes, mime_type, display_name), or None when neither source
-    holds any usable audio. Zero-length reads are treated as "absent" because
-    st.audio_input can yield an empty read and dispatching that wastes a call.
-    """
-    for source, is_recording in ((recording, True), (upload, False)):
-        if source is None:
-            continue
-        try:
-            raw = source.getvalue() if hasattr(source, "getvalue") else source.read()
-        except Exception:
-            continue
-        if not raw:
-            continue
-        name = getattr(source, "name", None) or ("recording.wav" if is_recording else "audio")
-        mime = getattr(source, "type", None) or _default_audio_mime(name, is_recording)
-        return raw, mime, name
-    return None
-
-
-# -----------------------------------------------------------------------------
-# Compression (mic recordings are always uncompressed WAV)
-# -----------------------------------------------------------------------------
-# st.audio_input ALWAYS emits mono 16-bit PCM WAV (verified in Streamlit's
-# frontend/lib/src/components/audio/core/encodeToWav.ts), and that UploadedFile
-# is itself subject to server.maxUploadSize. A 30-min 16 kHz recording is
-# 54.9 MB raw / 73.2 MB base64, which blows the 20 MB inline request cap 3.7x.
-# The same recording as MP3 @32 kbps is 6.9 MB / 9.2 MB base64 — measured peak
-# server RAM drops from 220 MB to 34 MB, because only the small encoded string
-# is ever held twice.
-#
-# Requires ffmpeg: add `ffmpeg` to packages.txt (Community Cloud apt-installs it).
-COMPRESS_TARGET_KBPS = 64
-# Policy ceiling so a stray multi-hour recording cannot chew CPU on a shared
-# frame. This is DERIVED from the bitrate rather than hardcoded, because the two
-# are not independent: 60 min at 64 kbps is 27.5 MB, which is OVER the ~15 MB
-# inline budget. A fixed 3600 s cap alongside a 64 kbps target would let users
-# record 60 minutes and then fail. Deriving it keeps the pair consistent for any
-# bitrate: at 64 kbps this works out to ~32 minutes.
-COMPRESS_MAX_SECONDS = int(inline_raw_budget_mb() * 1024 * 1024 / (COMPRESS_TARGET_KBPS * 1000 / 8))
-
-
-def needs_compression(raw_bytes: bytes, mime: str = "audio/wav") -> bool:
-    """True when this payload is too big to send inline as-is.
-
-    Size-driven, not MIME-driven: an oversized *uploaded* MP3 also needs to go
-    through the transcode (at a lower bitrate) or the user is stranded with
-    "upload a compressed file" when they already did.
-    """
-    return not check_inline_budget(raw_bytes, mime)[0]
-
-
-def configured_max_upload_mb() -> int:
-    """server.maxUploadSize in MB, defaulting to Streamlit's own default.
-
-    This cap governs st.audio_input as well as file_uploader, so it must clear
-    a full-length recording (60 min @16 kHz = ~110 MB) or the recording is
-    rejected at transfer, before compression can run.
-    """
-    try:
-        return int(st.config.get_option("server.maxUploadSize"))
-    except Exception:
-        return 200
-
-
-def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-
-def len_bytes_for_wav(seconds: float, rate: int = 16000) -> int:
-    """Size of a mono 16-bit WAV of `seconds`, matching Streamlit's encoder.
-
-    st.audio_input always emits mono 16-bit PCM, so size == seconds*rate*2 + 44.
-    Used to reason about transfer caps before any bytes exist.
-    """
-    return int(seconds) * rate * 2 + 44
-
-
-def audio_duration_seconds(raw_bytes: bytes, mime: str = "audio/wav") -> float | None:
-    """Duration in seconds for WAV (header parse) or other formats (ffprobe).
-
-    WAV is parsed in-process because it is the hot path and needs no subprocess.
-    Compressed formats have no simple parseable header, and ffprobe CANNOT read
-    duration from a pipe for them (it returns "N/A" because MP3/M4A duration
-    needs a seekable stream), so those are spooled to a temp file and probed.
-    Returns None when the duration cannot be determined.
-    """
-    if mime in ("audio/wav", "audio/x-wav", "audio/wave") or raw_bytes[:4] == b"RIFF":
-        return wav_duration_seconds(raw_bytes)
-
-    if not shutil.which("ffprobe"):
-        return None
-
-    suffix = _ext_for_mime(mime)
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
-            fh.write(raw_bytes)
-            tmp_path = fh.name
-        proc = subprocess.run(
-            [
-                "ffprobe", "-hide_banner", "-loglevel", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                tmp_path,
-            ],
-            capture_output=True,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            value = proc.stdout.decode("utf-8", "replace").strip()
-            if value.upper() != "N/A":
-                return float(value)
-    except (ValueError, OSError):
-        return None
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    return None
-
-
-def _ext_for_mime(mime: str) -> str:
-    """File extension for a MIME type, so ffprobe can sniff the container."""
-    return {
-        "audio/mpeg": ".mp3",
-        "audio/mp3": ".mp3",
-        "audio/mp4": ".m4a",
-        "audio/m4a": ".m4a",
-        "video/mp4": ".mp4",
-        "audio/ogg": ".ogg",
-        "audio/aac": ".aac",
-        "audio/flac": ".flac",
-        "audio/webm": ".webm",
-    }.get((mime or "").lower(), ".mp3")
-
-
-def compress_audio(raw_bytes: bytes, mime: str = "audio/wav", target_kbps: int | None = None) -> bytes:
-    """Transcode WAV bytes to MP3 via ffmpeg, returning MP3 bytes.
-
-    Pipes in and out so the transcoded result is the only new buffer held; the
-    source WAV is never copied again in Python.
-    """
-    if target_kbps is None:
-        target_kbps = COMPRESS_TARGET_KBPS
-
-    duration = wav_duration_seconds(raw_bytes) if mime == "audio/wav" else None
-    if duration and duration > COMPRESS_MAX_SECONDS:
-        raise ValueError(
-            f"Recording is {duration / 60:.1f} minutes, which exceeds the "
-            f"{COMPRESS_MAX_SECONDS / 60:.0f}-minute policy cap. Split it into "
-            "shorter segments."
-        )
-
-    if not ffmpeg_available():
-        raise RuntimeError(
-            "ffmpeg is not installed. Add 'ffmpeg' to packages.txt so Community "
-            "Cloud installs it, then redeploy."
-        )
-
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "libmp3lame",
-            "-b:a", f"{target_kbps}k",
-            "-f", "mp3",
-            "pipe:1",
-        ],
-        input=raw_bytes,
-        capture_output=True,
-    )
-    if proc.returncode != 0 or not proc.stdout:
-        raise RuntimeError(
-            "ffmpeg failed to transcode the recording: "
-            + (proc.stderr.decode("utf-8", "replace")[:300] or "no output")
-        )
-    return proc.stdout
-
-
-def wav_duration_seconds(data: bytes) -> float | None:
-    """Duration of a WAV blob in seconds, or None if `data` isn't parseable WAV.
-
-    Walks the RIFF chunk list instead of assuming a 44-byte canonical header:
-    browser recordings often carry LIST/fact chunks before `data`, and skipping
-    that walk is what makes a naive 44-byte offset report garbage.
-    """
-    if not data or len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        return None
-
-    fmt = None
-    data_size = None
-    pos = 12
-    end = len(data)
-
-    while pos + 8 <= end:
-        chunk_id = data[pos:pos + 4]
-        (chunk_size,) = struct.unpack("<I", data[pos + 4:pos + 8])
-        body = pos + 8
-
-        if chunk_id == b"fmt ":
-            if chunk_size < 16 or body + 16 > end:
-                return None
-            # fmt chunk = audio_format, channels, sample_rate, byte_rate, block_align, bits
-            _audio_fmt, channels, rate, _byte_rate, _align, bits = struct.unpack(
-                "<HHIIHH", data[body:body + 16]
-            )
-            fmt = (channels, rate, bits)
-        elif chunk_id == b"data":
-            # A streamed/truncated WAV can declare more than it carries.
-            available = max(0, min(chunk_size, end - body))
-            data_size = available
-            if fmt:
-                break
-
-        # Chunks are word-aligned: an odd size is followed by a pad byte.
-        pos = body + chunk_size + (chunk_size & 1)
-
-    if fmt is None or data_size is None:
-        return None
-
-    channels, rate, bits = fmt
-    if not channels or not rate or not bits:
-        return None
-    return data_size / float(channels * rate * (bits // 8))
-
-
-def check_inline_budget(raw_bytes: bytes, mime_type: str) -> tuple[bool, str]:
-    """Can this audio go inline in one Gemini request?
-
-    Returns (ok, message). `message` is empty when ok, else a user-facing
-    explanation quantifying the overshoot so the fix is obvious.
-    """
-    raw_mb = len(raw_bytes) / (1024 * 1024)
-    encoded_mb = raw_mb * 4.0 / 3.0
-    budget = inline_raw_budget_mb()
-
-    if encoded_mb <= (INLINE_REQUEST_CAP_MB - _PROMPT_OVERHEAD_MB):
-        return True, ""
-
-    detail = (
-        f"This audio is {raw_mb:.1f} MB raw (~{encoded_mb:.1f} MB once base64-encoded), "
-        f"which exceeds the {INLINE_REQUEST_CAP_MB:.0f} MB single-request cap. "
-        f"The inline budget is about {budget:.1f} MB raw."
-    )
-    dur = wav_duration_seconds(raw_bytes)
-    if dur:
-        bytes_per_second = len(raw_bytes) / dur
-        limit_minutes = (budget * 1024 * 1024) / bytes_per_second / 60
-        detail += (
-            f" Your recording is ~{dur / 60:.1f} minutes; at this quality the limit is "
-            f"roughly {limit_minutes:.1f} minutes."
-        )
-    detail += (
-        " Upload a compressed file (MP3/M4A) instead, or split the recording into "
-        "shorter parts and process them separately."
-    )
-    return False, detail
-
-
 def dispatch_http_request(endpoint_url: str, headers: dict, payload: dict) -> httpx.Response:
     with httpx.Client(timeout=360.0) as client:
         return client.post(endpoint_url, headers=headers, json=payload)
@@ -1899,66 +1596,15 @@ def main():
     # LEFT PANEL: Workflow Steps + Console
     # =========================================================================
     with col_left:
-        st.markdown("#### 1. Provide Meeting Audio")
-        # Upload is FIRST so it is the default: the pre-existing flow (and the
-        # happy path) is unchanged for anyone who does not opt into recording.
-        audio_source_mode = st.radio(
-            "Audio source:",
-            ["📁 Upload file", "🎙️ Record live"],
-            horizontal=True,
+        st.markdown("#### 1. Upload Audio")
+        audio_file = st.file_uploader(
+            "Select meeting recording",
+            type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
+            help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
             label_visibility="collapsed",
-            key="audio_source_mode",
         )
-
-        recorded_audio = None
-        audio_file = None
-
-        if audio_source_mode == "🎙️ Record live":
-            recorded_audio = st.audio_input(
-                "Record meeting audio",
-                sample_rate=16000,
-                key="live_recording",
-                help="Records from your microphone. 16 kHz gives the longest "
-                     "recording (up to ~60 min); longer takes are compressed "
-                     "automatically before analysis.",
-            )
-            if recorded_audio:
-                raw = recorded_audio.getvalue()
-                dur = wav_duration_seconds(raw)
-                size_mb = len(raw) / (1024 * 1024)
-                if dur:
-                    # Compressed before sending, so a long take is fine — warn
-                    # only when the recording exceeds the policy ceiling.
-                    if dur > COMPRESS_MAX_SECONDS:
-                        st.warning(
-                            f"🎙️ {dur / 60:.1f} min — over the "
-                            f"{COMPRESS_MAX_SECONDS / 60:.0f}-minute limit for a "
-                            "single recording. Split it into shorter parts."
-                        )
-                    else:
-                        st.caption(
-                            f"🎙️ Recorded {dur / 60:.1f} min ({size_mb:.1f} MB WAV, "
-                            f"compressed to ~{dur * COMPRESS_TARGET_KBPS * 1000 / 8 / 1048576:.1f} MB "
-                            "before sending)"
-                        )
-                else:
-                    st.caption(f"🎙️ Recorded audio ({size_mb:.1f} MB)")
-                ok, warn = check_inline_budget(raw, "audio/wav")
-                if not ok and not needs_compression(raw, "audio/wav"):
-                    st.warning(warn)
-        else:
-            audio_file = st.file_uploader(
-                "Select meeting recording",
-                type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
-                help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
-                label_visibility="collapsed",
-            )
-            if audio_file:
-                st.audio(audio_file)
-
-        resolved_audio = resolve_audio_source(recorded_audio, audio_file)
-        if resolved_audio:
-            st.caption(f"✅ Ready: `{resolved_audio[2]}` ({resolved_audio[1]})")
+        if audio_file:
+            st.audio(audio_file)
 
         st.markdown("#### 2. Meeting Document Template")
         doc_choice = st.radio(
@@ -2067,65 +1713,16 @@ def main():
                 st.error("Missing API Key. Open ⚙️ Settings in header.")
                 return
 
-            if not resolved_audio:
-                st.error("Please record audio or upload a file in Step 1.")
+            if not audio_file:
+                st.error("Please upload an audio file in Step 1.")
                 return
 
             st.session_state["logs_list"] = []
             log_event(log_container, st.session_state["logs_list"], "Execution initialized...", "INFO")
 
             try:
-                audio_bytes, mime, audio_name = resolved_audio
-
-                # Anything over the inline budget is transcoded here — this
-                # covers uncompressed mic WAV *and* an oversized compressed
-                # upload, both of which would otherwise blow the 20 MB cap.
-                duration = audio_duration_seconds(audio_bytes, mime)
-                if needs_compression(audio_bytes, mime):
-                    if not ffmpeg_available():
-                        st.error(
-                            "This audio is too large to send and needs ffmpeg to "
-                            "compress. Add `ffmpeg` to packages.txt and redeploy."
-                        )
-                        return
-                    with st.spinner(
-                        f"Compressing {duration / 60:.1f} min recording to fit the "
-                        "request limit…" if duration else "Compressing recording…"
-                    ):
-                        log_event(
-                            log_container,
-                            st.session_state["logs_list"],
-                            f"Compressing {audio_name} "
-                            f"({len(audio_bytes) / 1048576:.1f} MB WAV) to MP3 "
-                            f"@ {COMPRESS_TARGET_KBPS} kbps…",
-                            "INFO",
-                        )
-                        try:
-                            audio_bytes = compress_audio(audio_bytes, mime)
-                        except (ValueError, RuntimeError) as exc:
-                            st.error(str(exc))
-                            log_event(log_container, st.session_state["logs_list"], str(exc), "ERROR")
-                            return
-                    mime = "audio/mpeg"
-                    log_event(
-                        log_container,
-                        st.session_state["logs_list"],
-                        f"Compressed to {len(audio_bytes) / 1048576:.1f} MB MP3",
-                        "SUCCESS",
-                    )
-
-                budget_ok, budget_msg = check_inline_budget(audio_bytes, mime)
-                if not budget_ok:
-                    st.error(f"Audio too large for a single request. {budget_msg}")
-                    log_event(log_container, st.session_state["logs_list"], budget_msg, "ERROR")
-                    return
-
-                log_event(
-                    log_container,
-                    st.session_state["logs_list"],
-                    f"Source: {audio_name} ({mime})",
-                    "DEBUG",
-                )
+                audio_bytes = audio_file.read()
+                mime = audio_file.type if audio_file.type else "audio/mp3"
 
                 report, usage_metrics = analyze_meeting_audio_rest(
                     audio_file_bytes=audio_bytes,
@@ -2157,7 +1754,7 @@ def main():
     # =========================================================================
     with col_right:
         if "meeting_result" not in st.session_state:
-            st.info("👈 Record or upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
+            st.info("👈 Upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
             st.markdown(
                 """
                 ```
