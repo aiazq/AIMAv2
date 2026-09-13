@@ -170,7 +170,6 @@ st.markdown(
     /* Streamlit's theme selector varies by release; these selectors cover the
        app root, body, and inherited theme wrapper when a user selects Dark. */
     body[data-theme="dark"],
-    body:has([data-theme="dark"]),
     [data-theme="dark"],
     .stApp[data-theme="dark"] {
         --aima-bg: #0e1117;
@@ -184,30 +183,18 @@ st.markdown(
         --aima-shadow: rgba(0, 0, 0, 0.42);
     }
 
-    @media (prefers-color-scheme: dark) {
-        body, [data-testid="stAppViewContainer"] {
-            --aima-bg: var(--background-color, #0e1117);
-            --aima-ink: var(--text-color, #f2f6fa);
-            --aima-blue-dark: #a9d7f4;
-            --aima-sky: var(--secondary-background-color, #1b2b3a);
-            --aima-line: color-mix(in srgb, var(--aima-ink) 24%, transparent);
-            --aima-panel: var(--secondary-background-color, #182532);
-            --aima-muted: color-mix(in srgb, var(--aima-ink) 70%, transparent);
-            --aima-shadow: rgba(0, 0, 0, 0.42);
-        }
-    }
 
     body[data-theme="dark"] .priority-high,
-    body:has([data-theme="dark"]) .priority-high,
+    html[data-theme="dark"] .priority-high,
     [data-theme="dark"] .priority-high { color: #ffc0c0; background: #512d34; border-color: #814852; }
     body[data-theme="dark"] .priority-medium,
-    body:has([data-theme="dark"]) .priority-medium,
+    html[data-theme="dark"] .priority-medium,
     [data-theme="dark"] .priority-medium { color: #f5d98b; background: #4d3c1c; border-color: #80682b; }
     body[data-theme="dark"] .priority-low,
-    body:has([data-theme="dark"]) .priority-low,
+    html[data-theme="dark"] .priority-low,
     [data-theme="dark"] .priority-low { color: #9be0b8; background: #1d4638; border-color: #39785e; }
     body[data-theme="dark"] .priority-default,
-    body:has([data-theme="dark"]) .priority-default,
+    html[data-theme="dark"] .priority-default,
     [data-theme="dark"] .priority-default { color: #c2d0da; background: #293744; border-color: #526879; }
     </style>
     """,
