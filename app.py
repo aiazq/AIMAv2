@@ -126,6 +126,22 @@ st.markdown(
         display: block;
     }
 
+    /* Tagline beside the mark. Sized/weighted to sit as a peer of the wordmark
+       rather than compete with it, with a divider for separation.
+       Colour is pinned to the logo's own navy (#0B1423): the plate is always
+       light, so this stays legible in both themes. */
+    .aima-brand-text {
+        margin-left: 12px;
+        padding-left: 12px;
+        border-left: 1px solid rgba(11, 20, 35, 0.18);
+        font-size: 1.02rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        color: #0b1423;
+        white-space: nowrap;
+        line-height: 1.2;
+    }
+
     /* Streamlit wraps markdown in a container with its own bottom margin, which
        drops the plate below the row's vertical centre. Trim it on the header cell. */
     div[data-testid="stHorizontalBlock"]:has(.aima-brand) div[data-testid="stMarkdownContainer"] {
@@ -1592,8 +1608,10 @@ def main():
         _logo = _brand_logo_uri()
         if _logo:
             st.markdown(
-                f'<div class="aima-brand"><img src="{_logo}" '
-                f'alt="AIMA — AI Meeting Assistant"></div>',
+                '<div class="aima-brand">'
+                f'<img src="{_logo}" alt="AIMA">'
+                '<span class="aima-brand-text">AI Meeting Assistant</span>'
+                "</div>",
                 unsafe_allow_html=True,
             )
         else:
@@ -1821,14 +1839,6 @@ def main():
     # =========================================================================
     with col_right:
         if "meeting_result" not in st.session_state:
-            _wm = _brand_logo_uri()
-            if _wm:
-                st.markdown(
-                    '<div style="text-align:center; padding:1.6rem 0 0.2rem 0;">'
-                    f'<img src="{_wm}" alt="AIMA — AI Meeting Assistant" '
-                    'style="width:172px; max-width:45%; height:auto; opacity:0.55;"></div>',
-                    unsafe_allow_html=True,
-                )
             st.info("👈 Upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
             st.markdown(
                 """
