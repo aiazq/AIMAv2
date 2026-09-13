@@ -250,8 +250,34 @@ def test_mono_16bit_assumption_holds_at_the_documented_boundary():
 # (base64 9.2 MB) -> fits, and cuts peak server RAM from 220 MB to 34 MB.
 # ---------------------------------------------------------------------------
 def test_compression_constants_are_sane():
-    assert app.COMPRESS_TARGET_KBPS == 32
-    assert app.COMPRESS_MAX_SECONDS == 3600  # 60 min policy cap
+    assert app.COMPRESS_TARGET_KBPS == 64
+    # Derived from the bitrate, so it must land near 32 min at 64 kbps.
+    assert app.COMPRESS_MAX_SECONDS == pytest.approx(32 * 60, abs=60), app.COMPRESS_MAX_SECONDS
+
+
+def test_duration_cap_never_exceeds_the_inline_budget():
+    """The cap and the bitrate are NOT independent — guard the interaction.
+
+    A 60-minute cap at 64 kbps produces 27.5 MB, which blows the ~15 MB inline
+    budget: the user records for an hour and then gets rejected. Whatever the
+    chosen bitrate, cap * bitrate must fit inside the budget.
+    """
+    budget_bytes = app.inline_raw_budget_mb() * 1024 * 1024
+    worst_case = app.COMPRESS_MAX_SECONDS * app.COMPRESS_TARGET_KBPS * 1000 / 8
+    assert worst_case <= budget_bytes, (worst_case, budget_bytes)
+
+
+def test_worst_case_compressed_recording_fits_the_transport_cap():
+    """A max-length recording must also survive maxUploadSize as raw WAV."""
+    raw_wav_mb = app.len_bytes_for_wav(app.COMPRESS_MAX_SECONDS, 16000) / 1048576
+    assert raw_wav_mb < app.configured_max_upload_mb(), raw_wav_mb
+
+
+def test_sixty_minutes_at_64kbps_would_not_fit_so_the_cap_must_be_lower():
+    """Documents the conflict that motivated deriving the cap."""
+    sixty_min_bytes = 3600 * app.COMPRESS_TARGET_KBPS * 1000 / 8
+    assert sixty_min_bytes > app.inline_raw_budget_mb() * 1024 * 1024
+    assert app.COMPRESS_MAX_SECONDS < 3600
 
 
 @pytest.mark.parametrize("kbps", [16, 24, 32, 64])
@@ -346,3 +372,26 @@ def test_compress_rejects_over_policy_cap():
     too_long = make_wav(61 * 60.0)
     with pytest.raises(ValueError, match="exceeds"):
         app.compress_audio(too_long, "audio/wav")
+
+
+# ---------------------------------------------------------------------------
+# Default source must keep the pre-existing flow unaffected
+# ---------------------------------------------------------------------------
+def test_radio_offers_upload_first_so_it_is_the_default():
+    """The existing upload flow must remain the landing state.
+
+    st.radio defaults to the first option, so ordering is the behaviour: with
+    "Record live" first, every existing user would land on a mic permission
+    prompt instead of the file picker they had before.
+    """
+    import re
+
+    with open(os.path.join(ROOT, "app.py")) as fh:
+        src = fh.read()
+    m = re.search(
+        r"st\.radio\(\s*\"Audio source:\",\s*\[(.+?)\]", src, re.DOTALL
+    )
+    assert m, "audio source radio not found"
+    options = [o.strip().strip('"') for o in m.group(1).split(",")]
+    assert options[0] == "📁 Upload file", options
+    assert options[1] == "🎙️ Record live", options

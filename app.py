@@ -1359,10 +1359,14 @@ def resolve_audio_source(recording, upload) -> tuple[bytes, str, str] | None:
 # is ever held twice.
 #
 # Requires ffmpeg: add `ffmpeg` to packages.txt (Community Cloud apt-installs it).
-COMPRESS_TARGET_KBPS = 32
+COMPRESS_TARGET_KBPS = 64
 # Policy ceiling so a stray multi-hour recording cannot chew CPU on a shared
-# frame. 60 min @32 kbps = 14.4 MB, which stays inside the inline budget.
-COMPRESS_MAX_SECONDS = 3600
+# frame. This is DERIVED from the bitrate rather than hardcoded, because the two
+# are not independent: 60 min at 64 kbps is 27.5 MB, which is OVER the ~15 MB
+# inline budget. A fixed 3600 s cap alongside a 64 kbps target would let users
+# record 60 minutes and then fail. Deriving it keeps the pair consistent for any
+# bitrate: at 64 kbps this works out to ~32 minutes.
+COMPRESS_MAX_SECONDS = int(inline_raw_budget_mb() * 1024 * 1024 / (COMPRESS_TARGET_KBPS * 1000 / 8))
 
 
 def needs_compression(raw_bytes: bytes, mime: str = "audio/wav") -> bool:
@@ -1896,9 +1900,11 @@ def main():
     # =========================================================================
     with col_left:
         st.markdown("#### 1. Provide Meeting Audio")
+        # Upload is FIRST so it is the default: the pre-existing flow (and the
+        # happy path) is unchanged for anyone who does not opt into recording.
         audio_source_mode = st.radio(
             "Audio source:",
-            ["🎙️ Record live", "📁 Upload file"],
+            ["📁 Upload file", "🎙️ Record live"],
             horizontal=True,
             label_visibility="collapsed",
             key="audio_source_mode",
