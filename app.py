@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import datetime
 import io
-from html import escape
 import json
 import os
 import random
@@ -31,37 +30,17 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .stApp,
-    [data-testid="stAppViewContainer"] {
-        /* These are resolved from Streamlit's active theme on the app wrapper,
-           not from the device's OS preference. */
-        --aima-bg: var(--background-color, var(--st-color-background, #edf3f8));
-        --aima-ink: var(--text-color, var(--st-color-text, #13283f));
-        --aima-blue: #2e6ea8;
-        --aima-blue-dark: color-mix(in srgb, var(--aima-ink) 72%, #2e6ea8 28%);
-        --aima-sky: var(--secondary-background-color, var(--st-color-secondary-background, #e8f2fb));
-        --aima-line: color-mix(in srgb, var(--aima-ink) 22%, transparent);
-        --aima-panel: var(--secondary-background-color, var(--st-color-secondary-background, #f7fbff));
-        --aima-muted: color-mix(in srgb, var(--aima-ink) 62%, transparent);
-        --aima-green: #2b8b68;
-        --aima-shadow: rgba(25, 55, 83, 0.16);
-    }
-
-    html, body, [data-testid="stAppViewContainer"] {
-        background: var(--background-color, var(--st-color-background, #edf3f8)) !important;
-        color: var(--text-color, var(--st-color-text, #13283f));
-    }
-
     .block-container {
-        max-width: 1380px !important;
-        padding-top: 4.4rem !important;
-        padding-bottom: 2.5rem !important;
-        padding-left: clamp(0.75rem, 3vw, 2.75rem) !important;
-        padding-right: clamp(0.75rem, 3vw, 2.75rem) !important;
+        padding-top: 3.2rem !important;
+        padding-bottom: 2rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+        max-width: 100% !important;
     }
 
-    [data-testid="stHeader"] { background: transparent !important; }
-    div[data-testid="stPopover"] { margin-top: 0.65rem; }
+    div[data-testid="stPopover"] {
+        margin-top: 0.35rem;
+    }
 
     button[aria-label="Show password text"],
     button[aria-label="Hide password text"],
@@ -72,122 +51,106 @@ st.markdown(
         pointer-events: none !important;
     }
 
-    .aima-brand {
-        display: inline-flex; align-items: center; gap: 0.7rem;
-        background: linear-gradient(180deg, var(--aima-panel) 0%, var(--aima-bg) 100%);
-        border: 1px solid var(--aima-line); border-radius: 8px; padding: 7px 12px;
-        box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aima-ink) 12%, transparent), 0 2px 5px var(--aima-shadow);
-    }
-    .aima-brand img { width: 34px; height: 34px; object-fit: contain; display: block; }
-    .aima-brand-text { color: var(--aima-ink); font-size: 0.98rem; font-weight: 800; line-height: 1.15; white-space: nowrap; }
-    .aima-brand-sub { color: var(--aima-muted); display: block; font-size: 0.69rem; font-weight: 600; margin-top: 0.18rem; }
-
-    .retro-titlebar {
-        margin: 0.65rem 0 0.95rem; padding: 0.43rem 0.75rem;
-        color: #ffffff; background: linear-gradient(180deg, #4b91c8 0%, #245e96 52%, #1c4a78 100%);
-        border: 1px solid #173d63; border-radius: 5px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 4px var(--aima-shadow);
-        font-size: 0.72rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
-    }
-    .status-strip {
-        display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
-        margin: 0.15rem 0 1rem; padding: 0.52rem 0.72rem; background: var(--aima-panel);
-        border: 1px solid var(--aima-line); border-radius: 4px; color: var(--aima-muted); font-size: 0.73rem;
-        box-shadow: inset 0 1px 2px rgba(21, 59, 92, 0.05);
-    }
-    .status-strip strong { color: var(--aima-blue-dark); }
-    .status-dot { color: var(--aima-green); font-size: 0.9rem; vertical-align: -0.04em; }
-
-    .section-label { color: var(--aima-blue-dark); font-size: 0.74rem; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 0.28rem; }
-    .section-help { color: var(--aima-muted); font-size: 0.76rem; line-height: 1.45; margin: 0 0 0.7rem; }
-    .field-caption { color: var(--aima-muted); font-size: 0.72rem; margin: 0.3rem 0 0.65rem; }
-
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background: var(--aima-panel) !important;
-        border: 1px solid var(--aima-line) !important; border-radius: 7px !important;
-        box-shadow: 0 3px 8px var(--aima-shadow), inset 0 1px 0 color-mix(in srgb, var(--aima-ink) 10%, transparent);
-    }
-    div[data-testid="stVerticalBlockBorderWrapper"] > div { border-radius: 7px !important; }
-
     div[data-testid="stMetric"] {
-        background: linear-gradient(180deg, var(--aima-panel) 0%, var(--aima-sky) 100%);
-        border: 1px solid var(--aima-line); border-radius: 5px; padding: 0.5rem 0.7rem;
-        box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aima-ink) 10%, transparent), 0 1px 2px var(--aima-shadow);
-    }
-    div[data-testid="stMetricLabel"] { color: var(--aima-muted); font-size: 0.67rem; font-weight: 700; }
-    div[data-testid="stMetricValue"] { color: var(--aima-ink); font-size: 1.15rem; font-weight: 800; }
-
-    .empty-desk { text-align: center; padding: 2.3rem 1rem 2.6rem; }
-    .empty-desk-icon { display: inline-grid; place-items: center; width: 3.3rem; height: 3.3rem; border-radius: 50%; color: #fff; background: linear-gradient(180deg, #77afd8, #2a669b); border: 2px solid #d7ebfa; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55), 0 3px 7px var(--aima-shadow); font-size: 1.45rem; }
-    .empty-desk-title { color: var(--aima-ink); font-size: 1.32rem; font-weight: 900; margin: 0.85rem 0 0.4rem; }
-    .empty-desk-copy { color: var(--aima-muted); max-width: 34rem; margin: 0 auto 1.25rem; line-height: 1.55; font-size: 0.86rem; }
-    .desk-steps { display: flex; justify-content: center; flex-wrap: wrap; gap: 0.45rem; }
-    .desk-step { padding: 0.35rem 0.62rem; background: var(--aima-sky); border: 1px solid var(--aima-line); border-radius: 4px; color: var(--aima-blue-dark); font-size: 0.7rem; font-weight: 800; }
-
-    .result-heading { color: var(--aima-ink); font-size: clamp(1.25rem, 2.1vw, 1.85rem); font-weight: 900; line-height: 1.12; margin: 0; }
-    .result-meta { color: var(--aima-muted); font-size: 0.76rem; margin-top: 0.35rem; line-height: 1.5; }
-    .result-ribbon { color: #ffffff; background: linear-gradient(180deg, #5d9dd0, #2a659b); border: 1px solid #204e7a; border-radius: 4px; padding: 0.4rem 0.58rem; text-align: center; font-size: 0.69rem; font-weight: 800; box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }
-    .summary-box { background: var(--aima-panel); border: 1px solid var(--aima-line); border-left: 4px solid #3c83b8; border-radius: 4px; padding: 0.9rem 1rem; color: var(--aima-ink); line-height: 1.6; font-size: 0.88rem; box-shadow: inset 0 1px 3px rgba(21, 59, 92, 0.04); }
-    .summary-label { color: var(--aima-blue-dark); font-size: 0.7rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 0.35rem; }
-
-    .action-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.4rem 0.8rem; align-items: center; margin: 0.45rem 0; padding: 0.72rem 0.8rem; background: linear-gradient(180deg, var(--aima-panel), var(--aima-sky)); border: 1px solid var(--aima-line); border-radius: 4px; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aima-ink) 10%, transparent); }
-    .action-task { color: var(--aima-ink); font-weight: 800; line-height: 1.38; font-size: 0.84rem; }
-    .action-meta { color: var(--aima-muted); font-size: 0.71rem; margin-top: 0.26rem; }
-    .priority { border-radius: 3px; padding: 0.25rem 0.45rem; font-size: 0.65rem; font-weight: 900; white-space: nowrap; text-transform: uppercase; }
-    .priority-high { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #c96f76; }
-    .priority-medium { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #c7a64b; }
-    .priority-low { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid #4eaa7c; }
-    .priority-default { color: var(--aima-ink); background: var(--aima-sky); border: 1px solid var(--aima-line); }
-
-    .attendee-card { padding: 0.65rem 0.8rem; margin: 0.4rem 0; background: var(--aima-panel); border: 1px solid var(--aima-line); border-radius: 4px; }
-    .attendee-name { color: var(--aima-ink); font-size: 0.84rem; font-weight: 800; }
-    .attendee-role { color: var(--aima-muted); font-size: 0.71rem; margin-top: 0.15rem; }
-
-    .transcript-entry { display: grid; grid-template-columns: 2.1rem minmax(0, 1fr); gap: 0.65rem; padding: 0.7rem 0; border-bottom: 1px solid var(--aima-line); }
-    .transcript-entry:last-child { border-bottom: 0; }
-    .speaker-avatar { display: grid; place-items: center; width: 2rem; height: 2rem; color: #fff; background: linear-gradient(180deg, #77afd8, #2b689f); border: 1px solid #23577f; border-radius: 4px; font-size: 0.65rem; font-weight: 900; box-shadow: inset 0 1px 0 rgba(255,255,255,0.4); }
-    .transcript-speaker { color: var(--aima-ink); font-size: 0.8rem; font-weight: 900; }
-    .transcript-time { color: var(--aima-muted); font-size: 0.68rem; margin-left: 0.45rem; font-weight: 600; }
-    .transcript-text { color: var(--aima-ink); font-size: 0.82rem; line-height: 1.55; margin-top: 0.2rem; }
-
-    .terminal-container { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.72rem; background: #101b29; color: #c9d7e4; padding: 0.8rem; border: 1px solid #243b52; border-radius: 4px; height: 260px; overflow-y: auto; line-height: 1.48; white-space: pre-wrap; display: flex; flex-direction: column; box-shadow: inset 0 2px 5px rgba(0,0,0,0.18); }
-    .log-quip { color: #91adbf !important; font-size: 0.67rem !important; font-style: italic; padding-left: 0.45rem; display: block; margin: 2px 0; }
-    .log-info { color: #66c3f1; } .log-debug { color: #9aaaba; } .log-warn { color: #f2c35d; } .log-error { color: #f27d7d; } .log-success { color: #68d49a; }
-
-    button[kind="primary"] { background: linear-gradient(180deg, #72b1df 0%, #2c72a8 48%, #20577f 100%) !important; border: 1px solid #174566 !important; box-shadow: inset 0 1px 0 rgba(255,255,255,0.45), 0 2px 3px var(--aima-shadow) !important; }
-    button[kind="secondary"] { background: linear-gradient(180deg, var(--aima-panel), var(--aima-sky)) !important; border: 1px solid var(--aima-line) !important; color: var(--aima-ink) !important; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aima-ink) 10%, transparent), 0 1px 2px var(--aima-shadow) !important; }
-    div[data-baseweb="tab-list"] { gap: 0.2rem; border-bottom: 1px solid var(--aima-line); }
-    button[data-baseweb="tab"] { color: var(--aima-blue-dark); font-size: 0.73rem; font-weight: 800; padding: 0.55rem 0.45rem; }
-
-    @media (max-width: 760px) {
-        .block-container { padding-top: 3.9rem !important; padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
-        .aima-brand-text { font-size: 0.88rem; }
-        .retro-titlebar { font-size: 0.64rem; }
-        .status-strip { align-items: flex-start; flex-direction: column; }
-        .action-card { grid-template-columns: 1fr; }
-        .result-ribbon { margin-top: 0.35rem; }
-        button[data-baseweb="tab"] { font-size: 0.64rem; padding-left: 0.2rem; padding-right: 0.2rem; }
+        background-color: var(--secondary-background-color);
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        border: 1px solid rgba(128, 128, 128, 0.15);
     }
 
-
-    /* Keep the two header controls on the same baseline and make Settings a compact icon. */
-    div[data-testid="stHorizontalBlock"]:has(.aima-brand) button {
-        min-height: 2.45rem !important;
-        height: 2.45rem !important;
-        margin-top: 0 !important;
-        line-height: 1 !important;
+    /* Terminal Console Box with Native Auto-Scroll */
+    .terminal-container {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.82rem;
+        background-color: #0b0f19;
+        color: #d1d5db;
+        padding: 0.85rem;
+        border-radius: 8px;
+        height: 320px;
+        overflow-y: auto;
+        border: 1px solid #1f2937;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        display: flex;
+        flex-direction: column-reverse;
     }
-    div[data-testid="stHorizontalBlock"]:has(.aima-brand) div[data-testid="stPopover"] > button {
-        width: 2.45rem !important;
-        min-width: 2.45rem !important;
-        padding-left: 0 !important;
-        padding-right: 0 !important;
-        font-size: 1rem !important;
+
+    .log-quip {
+        font-size: 0.70rem !important;
+        color: #94a3b8 !important;
+        font-style: italic;
+        padding-left: 0.5rem;
+        display: block;
+        margin: 2px 0;
+    }
+
+    .log-info { color: #38bdf8; }
+    .log-debug { color: #9ca3af; }
+    .log-warn { color: #fbbf24; }
+    .log-error { color: #f87171; }
+    .log-success { color: #4ade80; }
+
+    /* Brand mark. The wordmark's "IMA" is dark navy (11,20,35): 18.4:1 on white
+       but 1.02:1 on a dark surface, i.e. invisible. Streamlit defaults the theme
+       to "auto" (follows the OS), so the plate is the thing that keeps the
+       wordmark legible rather than the page background.
+       Light mode: no border, background of the app's own white page -> reads as a
+       clean cut-out instead of a box.
+       Dark mode: the logo's native off-white becomes a deliberate light chip, so
+       it gets a hairline border to look intentional rather than pasted on.
+       Height is pinned so the plate matches the header row (34px art + 5px
+       padding + 1px border = 46px); otherwise it overflows and de-centres. */
+    .aima-brand {
+        display: inline-flex;
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        padding: 5px 12px;
+        box-shadow: none;
+        line-height: 0;
+        margin: 0;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        .aima-brand {
+            background: #f6f7fb;
+            border-color: rgba(255, 255, 255, 0.14);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+        }
+    }
+
+    .aima-brand img {
+        height: 34px;
+        width: auto;
+        display: block;
+    }
+
+    /* Tagline beside the mark. Sized/weighted to sit as a peer of the wordmark
+       rather than compete with it, with a divider for separation.
+       Colour is pinned to the logo's own navy (#0B1423): the plate is always
+       light, so this stays legible in both themes. */
+    .aima-brand-text {
+        margin-left: 12px;
+        padding-left: 12px;
+        border-left: 1px solid rgba(11, 20, 35, 0.18);
+        font-size: 1.02rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        color: #0b1423;
+        white-space: nowrap;
+        line-height: 1.2;
+    }
+
+    /* Streamlit wraps markdown in a container with its own bottom margin, which
+       drops the plate below the row's vertical centre. Trim it on the header cell. */
+    div[data-testid="stHorizontalBlock"]:has(.aima-brand) div[data-testid="stMarkdownContainer"] {
+        margin: 0 !important;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 
 
 def _brand_logo_uri(which: str = "aima_lockup.png") -> str:
@@ -1640,50 +1603,53 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
 # Main Application UI
 # -----------------------------------------------------------------------------
 def main():
-    # -------------------------------------------------------------------------
-    # Header / 2006-inspired control-desk chrome
-    # -------------------------------------------------------------------------
-    st.markdown('<div style="height:0.65rem"></div>', unsafe_allow_html=True)
-    h_col1, h_col2, h_col3 = st.columns([0.61, 0.2, 0.19], vertical_alignment="center")
+    h_col1, h_col2, h_col3 = st.columns([0.65, 0.18, 0.17], vertical_alignment="center")
     with h_col1:
-        logo_uri = _brand_logo_uri()
-        if logo_uri:
+        _logo = _brand_logo_uri()
+        if _logo:
             st.markdown(
                 '<div class="aima-brand">'
-                f'<img src="{logo_uri}" alt="AIMA">'
-                '<span><span class="aima-brand-text">AI Meeting Assistant</span><span class="aima-brand-sub">Meeting control desk · bilingual minutes</span></span>'
-                '</div>',
+                f'<img src="{_logo}" alt="AIMA">'
+                '<span class="aima-brand-text">AI Meeting Assistant</span>'
+                "</div>",
                 unsafe_allow_html=True,
             )
         else:
-            st.markdown('<div class="aima-brand"><span class="aima-brand-text">🎙️ AIMA · AI Meeting Assistant</span></div>', unsafe_allow_html=True)
+            st.markdown("### 🎙️ AIMA — AI Meeting Assistant")
     with h_col2:
-        if st.button("↻ Start Over", use_container_width=True, help="Clear the current meeting and reset the workspace", key="header_start_over"):
-            for key in [
-                "meeting_result", "usage_stats", "saved_template_bytes", "active_template_bytes",
-                "converted_template_download", "logs_list", "transcript_view_mode",
+        if st.button("🔄 Start Over", use_container_width=True, help="Clear session and reset all fields"):
+            for k in [
+                "meeting_result",
+                "usage_stats",
+                "saved_template_bytes",
+                "active_template_bytes",
+                "converted_template_download",
+                "logs_list",
             ]:
-                st.session_state.pop(key, None)
-            st.session_state["logs_list"] = ['<span class="log-debug">[System] Session reset. Ready.</span>']
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state["logs_list"] = [
+                '<span class="log-debug">[System] Session reset. Ready.</span>'
+            ]
             st.rerun()
     with h_col3:
-        with st.popover("⚙", use_container_width=False):
+        with st.popover("⚙️ Settings", use_container_width=True):
             st.markdown("**Provider & Model Settings**")
             has_key = bool(st.session_state.get("api_key"))
             st.caption(f"Status: {'🟢 Key is Set' if has_key else '🔴 No Key Set'}")
+
             new_key = st.text_input(
                 "API Key / Token:",
                 value="",
                 type="password",
                 placeholder="••••••••••••••••" if has_key else "Paste key...",
-                key="settings_api_key",
             )
             if new_key.strip():
                 st.session_state["api_key"] = new_key.strip()
                 st.rerun()
 
             current_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
-            new_base = st.text_input("Provider Endpoint URL:", value=current_base, key="settings_base_url")
+            new_base = st.text_input("Provider Endpoint URL:", value=current_base)
             if new_base != current_base:
                 st.session_state["base_url"] = new_base.strip()
                 st.session_state["available_models"] = fetch_available_models(
@@ -1694,322 +1660,330 @@ def main():
             st.markdown("---")
             models_list = st.session_state.get("available_models", [DEFAULT_MODEL])
             curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
-            model_idx = models_list.index(curr_model) if curr_model in models_list else 0
+            idx = models_list.index(curr_model) if curr_model in models_list else 0
+
             st.session_state["selected_model"] = st.selectbox(
-                "Active AI Model:", options=models_list, index=model_idx, key="settings_active_model"
+                "Active AI Model:",
+                options=models_list,
+                index=idx,
             )
-            if st.button("↻ Refresh model list", use_container_width=True, key="settings_refresh_models"):
+
+            if st.button("🔄 Refresh Models List", use_container_width=True):
                 st.session_state["available_models"] = fetch_available_models(
                     st.session_state["base_url"], st.session_state.get("api_key", "")
                 )
                 st.rerun()
 
-    st.markdown(
-        '<div class="retro-titlebar">AIMA / MEETING CONTROL DESK &nbsp;·&nbsp; CAPTURE → ORGANIZE → EXPORT</div>'
-        '<div class="status-strip"><span><span class="status-dot">●</span> <strong>Workspace ready</strong> · Your meeting intelligence console</span><span>WEB + MOBILE READY</span></div>',
-        unsafe_allow_html=True,
-    )
+    # Split Workspace
+    col_left, col_right = st.columns([0.40, 0.60], gap="large")
 
-    left_col, right_col = st.columns([0.38, 0.62], gap="large")
+    # =========================================================================
+    # LEFT PANEL: Workflow Steps + Console
+    # =========================================================================
+    with col_left:
+        st.markdown("#### 1. Upload Audio")
+        audio_file = st.file_uploader(
+            "Select meeting recording",
+            type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
+            help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
+            label_visibility="collapsed",
+        )
+        if audio_file:
+            st.audio(audio_file)
 
-    # -------------------------------------------------------------------------
-    # Left rail: the workflow
-    # -------------------------------------------------------------------------
-    with left_col:
-        with st.container(border=True):
-            st.markdown('<div class="section-label">01 / Import meeting audio</div><p class="section-help">Bring in the recording. AIMA separates speakers, translates when needed, and builds the brief.</p>', unsafe_allow_html=True)
-            audio_file = st.file_uploader(
-                "Select meeting recording",
-                type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
-                help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
-                label_visibility="collapsed",
-                key="meeting_audio_upload",
-            )
-            if audio_file:
-                st.audio(audio_file)
-                st.markdown(f'<p class="field-caption">Loaded: <strong>{escape(str(audio_file.name))}</strong></p>', unsafe_allow_html=True)
+        st.markdown("#### 2. Meeting Document Template")
+        doc_choice = st.radio(
+            "Template strategy:",
+            ["Default Clean Format", "Upload Tagged .docx", "AI Convert Sample Finished .docx"],
+            horizontal=False,
+            label_visibility="collapsed",
+        )
+
+        if doc_choice == "Default Clean Format":
+            st.session_state["active_template_bytes"] = None
+
+        elif doc_choice == "Upload Tagged .docx":
+            uploaded_tpl = st.file_uploader("Upload Word Template (.docx)", type=["docx"], key="tagged_docx")
+            if uploaded_tpl:
+                st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
+                st.caption("✅ Custom Tagged Template Armed")
+
+        elif doc_choice == "AI Convert Sample Finished .docx":
+            sample_file = st.file_uploader("Upload Finished Sample (.docx)", type=["docx"], key="sample_docx")
+            if sample_file:
+                tpl_status = st.empty()
+                if st.button("🤖 Build Universal AI Template from Sample", use_container_width=True):
+                    active_key = st.session_state.get("api_key")
+                    active_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
+                    active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
+
+                    if not active_key:
+                        st.error("API Key required for AI template generation. Configure it in ⚙️ Settings.")
+                    else:
+                        try:
+                            converted_io = generate_template_from_sample_ai(
+                                sample_bytes=sample_file.getvalue(),
+                                base_url=active_base,
+                                api_key=active_key,
+                                model_name=active_mod,
+                                status_container=tpl_status,
+                            )
+                            converted_bytes = converted_io.getvalue()
+                            st.session_state["active_template_bytes"] = converted_bytes
+                            st.session_state["converted_template_download"] = converted_bytes
+                        except Exception as err:
+                            tpl_status.error(f"AI conversion error: {err}")
+
+            if st.session_state.get("converted_template_download"):
+                st.download_button(
+                    label="📥 Download Generated Template (.docx)",
+                    data=st.session_state["converted_template_download"],
+                    file_name="AI_Generated_Meeting_Template.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+
+        st.markdown("#### 3. Process Meeting Audio")
+        run_clicked = st.button("⚡ Process Meeting Audio", type="primary", use_container_width=True)
+
+        st.markdown("---")
+
+        # LEFT BOTTOM: Execution Console
+        st.markdown("#### 📟 Execution Console")
+        status_text = st.empty()
+        progress_bar = st.progress(0)
+        log_container = st.empty()
+
+        reversed_initial = "<br>".join(reversed(st.session_state["logs_list"]))
+        initial_html = f'<div id="aima-terminal-box" class="terminal-container">{reversed_initial}</div>'
+        log_container.markdown(initial_html, unsafe_allow_html=True)
+
+        stats = st.session_state.get("usage_stats")
+        if stats:
+            st.markdown("##### 📊 Telemetry & Usage Stats")
+            has_thoughts = stats.get("thoughts_tokens", 0) > 0
+
+            if has_thoughts:
+                t_cols = st.columns(4)
+                with t_cols[0]:
+                    st.metric("Prompt", f"{stats['prompt_tokens']:,}")
+                with t_cols[1]:
+                    st.metric("Output", f"{stats['completion_tokens']:,}")
+                with t_cols[2]:
+                    st.metric("Thinking", f"{stats['thoughts_tokens']:,}")
+                with t_cols[3]:
+                    st.metric("Total Tokens", f"{stats['total_tokens']:,}")
             else:
-                st.markdown('<p class="field-caption">Accepted formats: MP3 · WAV · M4A · OGG · AAC · MP4</p>', unsafe_allow_html=True)
+                t_cols = st.columns(3)
+                with t_cols[0]:
+                    st.metric("Prompt", f"{stats['prompt_tokens']:,}")
+                with t_cols[1]:
+                    st.metric("Output", f"{stats['completion_tokens']:,}")
+                with t_cols[2]:
+                    st.metric("Total Tokens", f"{stats['total_tokens']:,}")
 
-            st.markdown('<div class="section-label">02 / Document output</div><p class="section-help">Use the clean minutes layout or bring a Word template from your team.</p>', unsafe_allow_html=True)
-            doc_choice = st.radio(
-                "Template strategy:",
-                ["Default Clean Format", "Upload Tagged .docx", "AI Convert Sample Finished .docx"],
-                horizontal=False,
-                label_visibility="collapsed",
-                key="document_template_strategy",
-            )
-
-            if doc_choice == "Default Clean Format":
-                st.session_state["active_template_bytes"] = None
-            elif doc_choice == "Upload Tagged .docx":
-                uploaded_tpl = st.file_uploader("Upload Word Template (.docx)", type=["docx"], key="tagged_docx")
-                if uploaded_tpl:
-                    st.session_state["active_template_bytes"] = uploaded_tpl.getvalue()
-                    st.caption("✅ Custom tagged template armed")
-            else:
-                sample_file = st.file_uploader("Upload Finished Sample (.docx)", type=["docx"], key="sample_docx")
-                if sample_file:
-                    template_status = st.empty()
-                    if st.button("✦ Build universal template from sample", use_container_width=True, key="build_ai_template"):
-                        active_key = st.session_state.get("api_key")
-                        active_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
-                        active_model = st.session_state.get("selected_model", DEFAULT_MODEL)
-                        if not active_key:
-                            st.error("API Key required for AI template generation. Configure it in ⚙ Settings.")
-                        else:
-                            try:
-                                converted_io = generate_template_from_sample_ai(
-                                    sample_bytes=sample_file.getvalue(),
-                                    base_url=active_base,
-                                    api_key=active_key,
-                                    model_name=active_model,
-                                    status_container=template_status,
-                                )
-                                converted_bytes = converted_io.getvalue()
-                                st.session_state["active_template_bytes"] = converted_bytes
-                                st.session_state["converted_template_download"] = converted_bytes
-                            except Exception as err:
-                                template_status.error(f"AI conversion error: {err}")
-                if st.session_state.get("converted_template_download"):
-                    st.download_button(
-                        label="↓ Download generated template",
-                        data=st.session_state["converted_template_download"],
-                        file_name="AI_Generated_Meeting_Template.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                        key="download_generated_template",
-                    )
-
-            st.markdown('<div class="section-label">03 / Generate minutes</div>', unsafe_allow_html=True)
-            run_clicked = st.button("▶ Process meeting audio", type="primary", use_container_width=True, key="process_meeting_audio")
-
-        st.markdown('<div class="retro-titlebar">LIVE PIPELINE CONSOLE</div>', unsafe_allow_html=True)
-        with st.container(border=True):
-            status_text = st.empty()
-            progress_bar = st.progress(0)
-            log_container = st.empty()
-            reversed_initial = "<br>".join(reversed(st.session_state["logs_list"]))
-            log_container.markdown(f'<div id="aima-terminal-box" class="terminal-container">{reversed_initial}</div>', unsafe_allow_html=True)
-
-            stats = st.session_state.get("usage_stats")
-            if stats:
-                st.markdown('<div class="section-label" style="margin-top:0.8rem">Latest run telemetry</div>', unsafe_allow_html=True)
-                has_thoughts = stats.get("thoughts_tokens", 0) > 0
-                metric_data = [("Prompt", f"{stats['prompt_tokens']:,}"), ("Output", f"{stats['completion_tokens']:,}")]
-                if has_thoughts:
-                    metric_data.append(("Thinking", f"{stats['thoughts_tokens']:,}"))
-                metric_data.append(("Total", f"{stats['total_tokens']:,}"))
-                metric_cols = st.columns(len(metric_data))
-                for col, (label, value) in zip(metric_cols, metric_data):
-                    with col:
-                        st.metric(label, value)
-                detail_cols = st.columns(2)
-                with detail_cols[0]:
-                    st.metric("Latency", f"{stats['latency']:.2f}s")
-                with detail_cols[1]:
-                    speed = f"{stats['speed']:.1f} tok/s" if stats['speed'] > 0 else "N/A"
-                    st.metric("Speed", speed)
+            p_cols = st.columns(2)
+            with p_cols[0]:
+                st.metric("Latency", f"{stats['latency']:.2f}s")
+            with p_cols[1]:
+                speed_str = f"{stats['speed']:.1f} tok/s" if stats['speed'] > 0 else "N/A"
+                st.metric("Speed", speed_str)
 
         if run_clicked:
             active_key = st.session_state.get("api_key")
             active_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
-            active_model = st.session_state.get("selected_model", DEFAULT_MODEL)
+            active_mod = st.session_state.get("selected_model", DEFAULT_MODEL)
+
             if not active_key:
-                st.error("Missing API Key. Open ⚙ Settings in the header.")
+                st.error("Missing API Key. Open ⚙️ Settings in header.")
                 return
+
             if not audio_file:
-                st.error("Please select a meeting recording in Step 1.")
+                st.error("Please upload an audio file in Step 1.")
                 return
 
             st.session_state["logs_list"] = []
             log_event(log_container, st.session_state["logs_list"], "Execution initialized...", "INFO")
+
             try:
                 audio_bytes = audio_file.read()
                 mime = audio_file.type if audio_file.type else "audio/mp3"
+
                 report, usage_metrics = analyze_meeting_audio_rest(
                     audio_file_bytes=audio_bytes,
                     mime_type=mime,
                     api_key=active_key,
                     base_url=active_base,
-                    model_name=active_model,
+                    model_name=active_mod,
                     progress_bar=progress_bar,
                     status_text=status_text,
                     log_container=log_container,
                     logs_list=st.session_state["logs_list"],
                 )
+
                 if report:
                     st.session_state["meeting_result"] = report
                     st.session_state["usage_stats"] = usage_metrics
                     st.session_state["saved_template_bytes"] = st.session_state.get("active_template_bytes")
                     st.rerun()
-            except Exception as err:
+
+            except Exception as e:
                 progress_bar.empty()
                 status_text.empty()
-                log_event(log_container, st.session_state["logs_list"], f"Execution failed: {str(err)}", "ERROR")
-                st.error(f"Error: {err}")
+                log_event(log_container, st.session_state["logs_list"], f"Execution failed: {str(e)}", "ERROR")
+                st.error(f"Error: {e}")
                 return
 
-    # -------------------------------------------------------------------------
-    # Right workspace: blank desk or meeting brief
-    # -------------------------------------------------------------------------
-    with right_col:
+    # =========================================================================
+    # RIGHT PANEL: Document View & Deliverables
+    # =========================================================================
+    with col_right:
         if "meeting_result" not in st.session_state:
-            with st.container(border=True):
-                st.markdown(
-                    '<div class="empty-desk"><div class="empty-desk-icon">✦</div><div class="empty-desk-title">Your meeting brief will land here</div><p class="empty-desk-copy">Choose a recording on the left and AIMA will turn the conversation into a polished, reviewable set of minutes.</p><div class="desk-steps"><span class="desk-step">Summary</span><span class="desk-step">Decisions</span><span class="desk-step">Owners</span><span class="desk-step">Bilingual transcript</span></div></div>',
-                    unsafe_allow_html=True,
-                )
+            st.info("👈 Upload meeting audio and follow Steps 1 to 3 on the left to produce your report.")
+            st.markdown(
+                """
+                ```
+                +-------------------------------------------------------------+
+                |                    MEETING DOCUMENT VIEWER                  |
+                |                                                             |
+                |  • Executive Summary (English)                              |
+                |  • Attendee Rosters (Names & Designations)                  |
+                |  • Diarized Speaker Verification & Re-mapping               |
+                |  • Bilingual Transcript (Original Spoken + Translated)      |
+                |  • Action Items Matrix (Owner, Department, Due, Remarks)    |
+                |  • Universal DOCX Generation & Export                       |
+                +-------------------------------------------------------------+
+                ```
+                """
+            )
         else:
             result: MeetingMinutesReport = st.session_state["meeting_result"]
             active_template = st.session_state.get("saved_template_bytes")
-            attendee_count = len(result.attendees)
-            topic_count = len(result.agenda_and_decisions)
-            action_count = len(result.action_items)
-            transcript_count = len(result.transcript)
 
-            with st.container(border=True):
-                header_left, header_right = st.columns([0.72, 0.28], vertical_alignment="top")
-                with header_left:
-                    st.markdown(f'<div class="section-label">Meeting brief / ready for review</div><div class="result-heading">{escape(str(result.title))}</div><div class="result-meta">📅 {escape(str(result.date))} &nbsp;·&nbsp; 👥 {attendee_count} attendees &nbsp;·&nbsp; 🌐 English + original language</div>', unsafe_allow_html=True)
-                with header_right:
-                    st.markdown('<div class="result-ribbon">MINUTES READY</div>', unsafe_allow_html=True)
-                    if active_template:
-                        try:
-                            doc_io = render_template_docx(active_template, result)
-                            template_used = True
-                        except Exception as ex:
-                            st.warning(f"Template rendering issue: {ex}. Using clean layout.")
-                            doc_io = build_default_docx(result)
-                            template_used = False
-                    else:
+            t_col1, t_col2 = st.columns([0.65, 0.35])
+            with t_col1:
+                st.markdown(f"## {result.title}")
+                attendee_names = [a.name for a in result.attendees]
+                st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(attendee_names)}")
+            with t_col2:
+                template_used = False
+                if active_template:
+                    try:
+                        doc_io = render_template_docx(active_template, result)
+                        template_used = True
+                    except Exception as ex:
+                        st.warning(f"⚠️ Template rendering issue: {ex}. Using clean layout.")
                         doc_io = build_default_docx(result)
                         template_used = False
-                    st.download_button(
-                        label="↓ Download filled template" if template_used else "↓ Download standard minutes",
-                        data=doc_io,
-                        file_name=f"{result.title.replace(' ', '_')}_Minutes.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                        type="primary",
-                        key="download_minutes_docx",
-                    )
+                else:
+                    doc_io = build_default_docx(result)
+                    template_used = False
 
-                st.markdown('<div style="height:0.8rem"></div>', unsafe_allow_html=True)
-                metrics = st.columns(4)
-                for col, label, value in zip(metrics, ["Attendees", "Topics", "Actions", "Transcript lines"], [attendee_count, topic_count, action_count, transcript_count]):
-                    with col:
-                        st.metric(label, value)
-
-                raw_speakers = sorted({entry.speaker for entry in result.transcript})
-                inferred_lookup = {ds.speaker_id: ds.inferred_name for ds in getattr(result, "detected_speakers", [])}
-                with st.expander("👥 Verify speaker identities", expanded=False):
-                    with st.form("speaker_mapping_form"):
-                        speaker_cols = st.columns(min(len(raw_speakers), 3) if raw_speakers else 1)
-                        confirmed_mapping = {}
-                        for index, speaker in enumerate(raw_speakers):
-                            column = speaker_cols[index % len(speaker_cols)]
-                            default_guess = inferred_lookup.get(speaker, "")
-                            if default_guess.lower() == "unknown":
-                                default_guess = ""
-                            with column:
-                                confirmed_mapping[speaker] = st.text_input(
-                                    f"Label: {speaker}",
-                                    value=default_guess if default_guess else speaker,
-                                    key=f"speaker_label_{speaker}",
-                                )
-                        if st.form_submit_button("Update names across brief", use_container_width=True):
-                            st.session_state["meeting_result"] = apply_speaker_replacements(result, confirmed_mapping)
-                            st.rerun()
-
-                tab_overview, tab_actions, tab_attendees, tab_transcript, tab_raw = st.tabs(
-                    ["Overview", "Action items", "Attendees", "Transcript", "Raw data"]
+                download_label = "📥 Download Filled Template (.docx)" if template_used else "📥 Download Standard .docx"
+                st.download_button(
+                    label=download_label,
+                    data=doc_io,
+                    file_name=f"{result.title.replace(' ', '_')}_Minutes.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    type="primary",
                 )
 
-                with tab_overview:
-                    st.markdown('<div class="summary-label">Executive summary</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="summary-box">{escape(str(result.executive_summary))}</div>', unsafe_allow_html=True)
-                    st.markdown("### Agenda & decisions")
-                    if result.agenda_and_decisions:
-                        for item in result.agenda_and_decisions:
-                            decision_count = len(item.decisions_made)
-                            with st.expander(f"{item.topic} · {decision_count} decision{'s' if decision_count != 1 else ''}", expanded=True):
-                                st.write(item.discussion_summary)
-                                if item.decisions_made:
-                                    st.markdown("**Decisions reached**")
-                                    for decision in item.decisions_made:
-                                        st.markdown(f"- {decision}")
+            # Speaker Mapping Component
+            raw_speakers = sorted(list({entry.speaker for entry in result.transcript}))
+            inferred_lookup = {ds.speaker_id: ds.inferred_name for ds in getattr(result, "detected_speakers", [])}
+
+            with st.expander("👥 Speaker Identity Mapping & Verification", expanded=False):
+                with st.form("speaker_mapping_form"):
+                    cols = st.columns(min(len(raw_speakers), 3) if raw_speakers else 1)
+                    confirmed_mapping = {}
+
+                    for idx, spk in enumerate(raw_speakers):
+                        col = cols[idx % len(cols)]
+                        default_guess = inferred_lookup.get(spk, "")
+                        if default_guess.lower() == "unknown":
+                            default_guess = ""
+
+                        with col:
+                            confirmed_name = st.text_input(
+                                f"Label: {spk}",
+                                value=default_guess if default_guess else spk,
+                                key=f"spk_{spk}",
+                            )
+                            confirmed_mapping[spk] = confirmed_name
+
+                    if st.form_submit_button("⚡ Update Names Across Document", use_container_width=True):
+                        st.session_state["meeting_result"] = apply_speaker_replacements(result, confirmed_mapping)
+                        st.rerun()
+
+            # Structured Deliverables
+            tab_overview, tab_actions, tab_attendees, tab_transcript, tab_raw = st.tabs(
+                ["📄 Overview & Agendas", "✅ Action Items", "👥 Attendees", "📝 Diarized Transcript", "🔧 Raw Data"]
+            )
+
+            with tab_overview:
+                st.markdown("### Executive Summary")
+                st.write(result.executive_summary)
+                st.markdown("---")
+
+                st.markdown("### Agenda Breakdown & Decisions")
+                for item in result.agenda_and_decisions:
+                    with st.expander(f"Topic: {item.topic}", expanded=True):
+                        st.write(item.discussion_summary)
+                        if item.decisions_made:
+                            st.markdown("**Decisions Reached:**")
+                            for dec in item.decisions_made:
+                                st.markdown(f"- {dec}")
+
+                if result.next_meeting_date != "TBD" or result.next_meeting_agenda_focus:
+                    st.markdown("---")
+                    st.markdown("### Next Meeting Logistics")
+                    st.write(f"**Date:** {result.next_meeting_date} | **Time:** {result.next_meeting_time}")
+                    if result.next_meeting_agenda_focus:
+                        st.write(f"**Agenda Focus:** {result.next_meeting_agenda_focus}")
+
+            with tab_actions:
+                st.markdown("### Action Items Matrix")
+                if result.action_items:
+                    st.dataframe([item.model_dump() for item in result.action_items], use_container_width=True)
+                else:
+                    st.info("No action items detected in the discussion.")
+
+            with tab_attendees:
+                st.markdown("### Attendee Roster")
+                if result.attendees:
+                    st.dataframe([a.model_dump() for a in result.attendees], use_container_width=True)
+                else:
+                    st.info("No attendees recorded.")
+
+            with tab_transcript:
+                view_mode = st.radio(
+                    "Transcript View Mode:",
+                    ["English Translation", "Original Spoken Language", "Bilingual Side-by-Side"],
+                    horizontal=True,
+                )
+
+                for entry in result.transcript:
+                    ts = f"`{entry.timestamp}` " if entry.timestamp else ""
+                    if view_mode == "English Translation":
+                        st.markdown(f"{ts}**{entry.speaker}**: {entry.translated_text}")
+                    elif view_mode == "Original Spoken Language":
+                        st.markdown(f"{ts}**{entry.speaker}**: {entry.original_text}")
                     else:
-                        st.info("No agenda topics were detected.")
-                    if result.next_meeting_date != "TBD" or result.next_meeting_agenda_focus:
-                        st.markdown("### Next meeting logistics")
-                        st.write(f"**Date:** {result.next_meeting_date} | **Time:** {result.next_meeting_time}")
-                        if result.next_meeting_agenda_focus:
-                            st.write(f"**Agenda focus:** {result.next_meeting_agenda_focus}")
+                        st.markdown(f"{ts}**{entry.speaker}**")
+                        st.markdown(f"- *Original:* {entry.original_text}")
+                        st.markdown(f"- *English:* {entry.translated_text}")
 
-                with tab_actions:
-                    st.markdown('<div class="summary-label">Action register</div>', unsafe_allow_html=True)
-                    if result.action_items:
-                        cards = []
-                        for item in result.action_items:
-                            remarks = str(item.remarks or "")
-                            priority_match = re.search(r"\\b(high|medium|low)\\b", remarks, flags=re.IGNORECASE)
-                            priority = priority_match.group(1).title() if priority_match else "Tracked"
-                            priority_class = priority.lower() if priority.lower() in ["high", "medium", "low"] else "default"
-                            meta = f"Owner: {item.owner}"
-                            if item.department:
-                                meta += f" · {item.department}"
-                            meta += f" · Due: {item.deadline}"
-                            if remarks and priority == "Tracked":
-                                meta += f" · {remarks}"
-                            cards.append(f'<div class="action-card"><div><div class="action-task">{escape(str(item.task))}</div><div class="action-meta">{escape(meta)}</div></div><span class="priority priority-{priority_class}">{escape(priority)}</span></div>')
-                        st.markdown("".join(cards), unsafe_allow_html=True)
-                    else:
-                        st.info("No action items detected in the discussion.")
-
-                with tab_attendees:
-                    st.markdown('<div class="summary-label">Attendee roster</div>', unsafe_allow_html=True)
-                    if result.attendees:
-                        attendee_cards = []
-                        for attendee in result.attendees:
-                            role = escape(str(attendee.designation)) if attendee.designation else "Role not specified"
-                            attendee_cards.append(f'<div class="attendee-card"><div class="attendee-name">{escape(str(attendee.name))}</div><div class="attendee-role">{role}</div></div>')
-                        st.markdown("".join(attendee_cards), unsafe_allow_html=True)
-                    else:
-                        st.info("No attendees recorded.")
-
-                with tab_transcript:
-                    view_mode = st.radio(
-                        "Transcript view:",
-                        ["English Translation", "Original Spoken Language", "Bilingual Side-by-Side"],
-                        horizontal=True,
-                        key="transcript_view_mode",
-                    )
-                    entries = []
-                    for entry in result.transcript:
-                        speaker = str(entry.speaker or "Unknown")
-                        initials = "".join(part[0] for part in speaker.split()[:2]).upper() or "?"
-                        timestamp = f'<span class="transcript-time">{escape(str(entry.timestamp))}</span>' if entry.timestamp else ""
-                        if view_mode == "English Translation":
-                            text = escape(str(entry.translated_text))
-                        elif view_mode == "Original Spoken Language":
-                            text = escape(str(entry.original_text))
-                        else:
-                            text = f'<strong>Original:</strong> {escape(str(entry.original_text))}<br><strong>English:</strong> {escape(str(entry.translated_text))}'
-                        entries.append(f'<div class="transcript-entry"><div class="speaker-avatar">{escape(initials)}</div><div><div class="transcript-speaker">{escape(speaker)}{timestamp}</div><div class="transcript-text">{text}</div></div></div>')
-                    st.markdown("".join(entries) if entries else '<p class="field-caption">No transcript lines were returned.</p>', unsafe_allow_html=True)
-
-                with tab_raw:
-                    st.markdown('<div class="summary-label">Export metadata</div>', unsafe_allow_html=True)
-                    json_bytes = json.dumps(result.model_dump(), indent=2)
-                    st.download_button(
-                        label="↓ Export raw JSON",
-                        data=json_bytes,
-                        file_name="meeting_metadata.json",
-                        mime="application/json",
-                        key="download_meeting_json",
-                    )
-                    st.json(result.model_dump())
+            with tab_raw:
+                st.markdown("### Export JSON Metadata")
+                json_bytes = json.dumps(result.model_dump(), indent=2)
+                st.download_button(
+                    label="Export Raw JSON",
+                    data=json_bytes,
+                    file_name="meeting_metadata.json",
+                    mime="application/json",
+                )
+                st.json(result.model_dump())
 
 
 if __name__ == "__main__":
