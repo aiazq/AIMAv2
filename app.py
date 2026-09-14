@@ -176,7 +176,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.2"
+APP_VERSION = "v0.2.1"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1854,6 +1854,130 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
     return updated
 
 
+def apply_datetime_overrides(
+    report: MeetingMinutesReport,
+    new_date: datetime.date | None,
+    new_time: datetime.time | None,
+) -> MeetingMinutesReport:
+    """Return a copy of `report` with the meeting date and/or start time replaced.
+
+    The document already carries these fields, so overriding them here reaches
+    every consumer — the on-screen header, the default DOCX, and a custom Jinja
+    template's `{{ date }}` / `{{ meeting_time }}` — without touching the
+    transcript or any other content.
+
+    A `None` argument means "leave this field alone", which is how the caller
+    distinguishes "the user cleared the widget" from "the user did not touch it".
+    """
+    updated = report.model_copy(deep=True)
+    if new_date is not None:
+        updated.date = format_report_date(new_date)
+    if new_time is not None:
+        updated.meeting_time = format_report_time(new_time)
+    return updated
+
+
+_EMPTY_DATE_TOKENS = {"", "undated", "tbd", "n/a", "na", "none", "unknown", "null", "nil", "-", "--", "---"}
+_EMPTY_TIME_TOKENS = {"", "tbd", "n/a", "na", "none", "unknown", "null", "nil", "-", "--", "---"}
+
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+    "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
+    "%B %d %Y", "%b %d %Y", "%d-%b-%Y", "%d %B, %Y", "%Y%m%d",
+)
+
+
+def parse_report_date(raw, fallback: datetime.date | None = None) -> datetime.date | None:
+    """Best-effort parse of the model's free-text date into a real date.
+
+    `result.date` is free text — "2026-09-12", but equally "Undated" (the schema
+    default), "12 September 2026", or "2026-09-12 (Saturday)". `st.date_input`
+    needs an actual `datetime.date`, and `date.fromisoformat("Undated")` raises,
+    so an unparseable value must degrade to `fallback` rather than crash the
+    render. It never raises.
+    """
+    if isinstance(raw, datetime.datetime):
+        return raw.date()
+    if isinstance(raw, datetime.date):
+        return raw
+    if raw is None:
+        return fallback
+
+    text = str(raw).strip()
+    if text.lower() in _EMPTY_DATE_TOKENS:
+        return fallback
+
+    # Drop trailing annotations: "2026-09-12 (Saturday)", "2026-09-12 - Day 2"
+    cleaned = re.split(r"[(\[]", text, maxsplit=1)[0].strip()
+    for candidate in (cleaned, text):
+        if not candidate:
+            continue
+        try:
+            return datetime.date.fromisoformat(candidate)
+        except ValueError:
+            pass
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                continue
+        for sep in (" to ", " until ", " - ", " – ", " — ", "–", "—"):
+            if sep in candidate:
+                head = candidate.split(sep, 1)[0].strip()
+                if head and head != candidate:
+                    try:
+                        return datetime.date.fromisoformat(head)
+                    except ValueError:
+                        for fmt in _DATE_FORMATS:
+                            try:
+                                return datetime.datetime.strptime(head, fmt).date()
+                            except ValueError:
+                                continue
+    return fallback
+
+
+def parse_report_time(raw, fallback: datetime.time | None = None) -> datetime.time | None:
+    """Best-effort parse of the model's free-text time into a real time.
+
+    `meeting_time` is documented as "Meeting time range if mentioned", so a range
+    like "10:00 - 11:30" is expected input and its START is the start time. Never
+    raises; unparseable input degrades to `fallback`.
+    """
+    if isinstance(raw, datetime.time):
+        return raw
+    if isinstance(raw, datetime.datetime):
+        return raw.time()
+    if raw is None:
+        return fallback
+
+    text = str(raw).strip()
+    if text.lower() in _EMPTY_TIME_TOKENS:
+        return fallback
+
+    # A range: take the start, which is what "Meeting Start Time" means.
+    for sep in (" – ", " — ", " - ", " to ", " until ", "–", "—"):
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
+            if head:
+                text = head
+            break
+
+    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p", "%I:%M%p", "%I %p", "%H%M"):
+        try:
+            return datetime.datetime.strptime(text.upper(), fmt).time()
+        except ValueError:
+            continue
+    return fallback
+
+
+def format_report_date(value: datetime.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def format_report_time(value: datetime.time) -> str:
+    return value.strftime("%H:%M")
+
+
 # -----------------------------------------------------------------------------
 # Main Application UI
 # -----------------------------------------------------------------------------
@@ -2251,6 +2375,53 @@ def main():
                     use_container_width=True,
                     type="primary",
                 )
+
+            # Meeting Date & Start Time Component
+            #
+            # Sits ABOVE the speaker panel: date and time describe the meeting as a
+            # whole, so settling them first means the speaker mapping applies on top
+            # of a correct header.
+            #
+            # `result.date` is free text from the model and may be 'Undated' (the
+            # schema default) or a verbose form, none of which `st.date_input`
+            # accepts — so both values are parsed defensively before being used as
+            # widget defaults, and a value that cannot be read falls back to today
+            # with an explicit warning rather than crashing the render.
+            _today = datetime.date.today()
+            _parsed_date = parse_report_date(result.date, fallback=_today)
+            _parsed_time = parse_report_time(result.meeting_time, fallback=datetime.time(9, 0))
+            _date_unreadable = parse_report_date(result.date) is None and bool((result.date or "").strip())
+
+            with st.expander(
+                f"📅 Meeting Date & Start Time — {result.date.strip() or 'not set'}"
+                f", {result.meeting_time.strip() or 'not set'}",
+                expanded=False,
+            ):
+                if _date_unreadable:
+                    st.warning(
+                        f"The transcript did not yield a readable date (`{result.date}`). "
+                        "Defaulted to today — please confirm."
+                    )
+
+                with st.form("datetime_form"):
+                    d_col, t_col = st.columns(2)
+                    with d_col:
+                        chosen_date = st.date_input(
+                            "Meeting Date", value=_parsed_date, key="meeting_date_input",
+                            help="Correct the meeting date used in the minutes header and exports.",
+                        )
+                    with t_col:
+                        chosen_time = st.time_input(
+                            "Meeting Start Time", value=_parsed_time, key="meeting_time_input",
+                            step=datetime.timedelta(minutes=1),
+                            help="Start time of the meeting. Applied to the header and exports.",
+                        )
+
+                    if st.form_submit_button("💾 Save Date & Time", use_container_width=True):
+                        st.session_state["meeting_result"] = apply_datetime_overrides(
+                            result, chosen_date, chosen_time
+                        )
+                        st.rerun()
 
             # Speaker Mapping Component
             raw_speakers = sorted(list({entry.speaker for entry in result.transcript}))

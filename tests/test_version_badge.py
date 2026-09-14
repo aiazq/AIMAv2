@@ -59,24 +59,29 @@ def test_app_exposes_a_version_constant():
     assert re.fullmatch(r"v\d+\.\d+(\.\d+)?", app.APP_VERSION), app.APP_VERSION
 
 
-def test_version_is_the_v0_2_release():
-    assert app.APP_VERSION == "v0.2"
+def test_version_is_the_current_release():
+    """Pins the release. Bumping APP_VERSION without updating this is a deliberate
+    two-file edit, so a version bump can never be accidental."""
+    assert app.APP_VERSION == "v0.2.1"
 
 
 def test_version_is_not_duplicated_as_a_literal():
     """The badge must read the constant, not restate the number.
 
     Two hardcoded copies drift: one gets bumped, the other does not. Counting
-    bare `v0.2` occurrences (not just standalone string literals) catches a
-    version embedded inside a longer string such as "AIMA v0.2".
+    occurrences of the CURRENT version (not just standalone string literals)
+    catches a version embedded inside a longer string such as "AIMA v0.2.1".
+    Version-agnostic on purpose, so a bump does not require editing this test.
     """
     src = open(os.path.join(ROOT, "app.py"), encoding="utf-8").read()
-    occurrences = re.findall(r"v0\.2", src)
+    occurrences = re.findall(re.escape(app.APP_VERSION), src)
     assert len(occurrences) == 1, (
-        f"expected the version to appear exactly once (the APP_VERSION "
+        f"expected {app.APP_VERSION} to appear exactly once (the APP_VERSION "
         f"constant), found {len(occurrences)} occurrences"
     )
-    assert re.search(r"APP_VERSION\s*=\s*\"v0\.2\"", src), "v0.2 must be the constant's value"
+    assert re.search(rf"APP_VERSION\s*=\s*\"{re.escape(app.APP_VERSION)}\"", src), (
+        "the version must be assigned to APP_VERSION"
+    )
     assert re.search(r"st\.caption\(f\"AIMA \{APP_VERSION\}\"\)", src), (
         "the footer must interpolate APP_VERSION"
     )
