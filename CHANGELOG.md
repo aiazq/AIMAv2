@@ -1,0 +1,50 @@
+# Changelog
+
+Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
+a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
+`app.py` and the git tag must always match — they are bumped in the same commit.
+
+## v0.2 — Multi-file meetings
+
+The release that makes AIMA usable on meetings recorded in parts.
+
+### Added
+- **Multi-file upload.** Upload up to 3 recordings of the same meeting; each is
+  individually playable so you can confirm you have the right parts.
+- **Call ordering.** Each part takes an `Order` number, seeded from a natural
+  filename sort so `part_2` lands before `part_10`.
+- **Single stitched output.** All parts are sent to the model in **one request,
+  in order**, and come back as one transcript and one set of minutes — not
+  three reports to merge by hand.
+- **Audio compression.** Parts are transcoded to mono 16 kHz before sending.
+  Three 90 MB recordings otherwise peak around 988 MB against Community Cloud's
+  1024 MB ceiling — it does not slow down, it dies.
+- **Pre-flight size gate.** An over-budget batch is refused up front with a clear
+  message, instead of transferring, encoding, and failing minutes later with 413.
+- **Version stamp** at the foot of the page.
+- `packages.txt` declaring `ffmpeg` for Community Cloud.
+
+### Fixed
+- **A single incomplete transcript segment no longer discards the whole report.**
+  A 43-segment response with `translated_text` missing on one segment was
+  rejected outright by Pydantic —
+  `1 validation error for MeetingMinutesReport: transcript.42.translated_text
+  Field required` — throwing away a completed transcription and translation.
+  Every schema field is now optional or coerced: a missing translation falls
+  back to the original text so the segment still renders, an explicit `null`
+  becomes `""`, and a bare string where a list is expected becomes a one-item
+  list. A repair is logged as a `WARN` naming the affected segment indices, so a
+  degraded response stays visible instead of silently papered over.
+- The same fragility is fixed across `Attendee`, `ActionItem`, `AgendaItem`,
+  `DetectedSpeaker` and `MeetingMinutesReport`. The missing `translated_text` was
+  the first key to trip it, not the only one.
+
+### Verified
+- 99 tests pass. The audio and parsing paths are exercised against synthesised
+  provider responses; the fix was falsified against the pre-fix schema, which
+  reproduces the reported error verbatim.
+
+## v0.1 — Baseline
+
+The hackathon release: single-file upload, transcription, diarization,
+translation, summarisation, and DOCX export from a custom Jinja-tagged template.
