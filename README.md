@@ -8,6 +8,8 @@ Powered by **Streamlit** and **Gemini 3.6 Flash**.
 
 ## ✨ Features
 
+- **Multi-File Meetings:** Upload up to 3 recordings of the same meeting, order
+  them, and receive a single stitched transcript and set of minutes.
 - **End-to-End Audio Processing:** Handles transcription, voice separation (diarization), summarization, and task extraction in a single pass.
 - **Custom DOCX Templating:** Upload your company's Word template (`.docx`) with Jinja2 placeholders, or let AIMA construct a clean, standard executive document.
 - **Action Item Extraction:** Captures assignees, task descriptions, deadlines, and priorities directly into an interactive data table.

@@ -173,6 +173,11 @@ def _brand_logo_uri(which: str = "aima_lockup.png") -> str:
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.6-flash"
 
+# Single source of truth for the release shown at the foot of the page. Bump this
+# and the git tag together — a badge that disagrees with the tag tells the user
+# they are running code they are not.
+APP_VERSION = "v0.2"
+
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
 
@@ -2346,3 +2351,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# -----------------------------------------------------------------------------
+# Version stamp — rendered last so it sits at the foot of the page.
+# Reads APP_VERSION, never a literal, so it cannot drift from the constant.
+# -----------------------------------------------------------------------------
+st.caption(f"AIMA {APP_VERSION}")
