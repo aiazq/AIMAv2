@@ -16,6 +16,8 @@ from docx.text.paragraph import Paragraph
 from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field, field_validator
 
+import media_pipeline
+
 # -----------------------------------------------------------------------------
 # Configuration & Styling
 # -----------------------------------------------------------------------------
@@ -1377,22 +1379,94 @@ def analyze_meeting_audio_rest(
     status_text,
     log_container,
     logs_list,
+    extra_parts: list[tuple[bytes, str]] | None = None,
 ) -> tuple[MeetingMinutesReport | None, dict | None]:
-    file_size_mb = len(audio_file_bytes) / (1024 * 1024)
-    log_event(log_container, logs_list, f"Ingested raw stream: {file_size_mb:.2f} MB ({mime_type})", "INFO")
+    extra_parts = extra_parts or []
+
+    # Every part travels in ONE request, in user order, so the model sees a single
+    # continuous meeting rather than N unrelated recordings.
+    all_parts = [(audio_file_bytes, mime_type)] + list(extra_parts)
+
+    raw_total_mb = sum(len(b) for b, _ in all_parts) / (1024 * 1024)
+    log_event(
+        log_container,
+        logs_list,
+        f"Ingested {len(all_parts)} part(s): {raw_total_mb:.2f} MB total",
+        "INFO",
+    )
+
+    ok, budget_msg = media_pipeline.validate_batch(
+        [len(b) for b, _ in all_parts], media_pipeline.MAX_TOTAL_MB
+    )
+    if not ok:
+        raise RuntimeError(budget_msg)
+
+    # Transcode each part down to mono speech bitrate. This is what keeps the run
+    # inside the container's memory budget: base64 + JSON serialization costs
+    # ~3.7x raw bytes, and 270 MB raw would peak near 1 GB.
+    encoded: list[tuple[bytes, str]] = []
+    for idx, (raw_bytes, mime) in enumerate(all_parts, start=1):
+        suffix = "." + (mime.split("/")[-1].replace("mpeg", "mp3") or "mp3")
+        status_text.markdown(
+            f"🔄 *Compressing part {idx}/{len(all_parts)} for efficient upload...*"
+        )
+        progress_bar.progress(int(5 + 20 * (idx - 1) / max(len(all_parts), 1)))
+        compressed = media_pipeline.compress_audio(raw_bytes, suffix)
+        if len(compressed) < len(raw_bytes):
+            log_event(
+                log_container,
+                logs_list,
+                f"Part {idx}: {len(raw_bytes) / (1024 * 1024):.2f} MB → "
+                f"{len(compressed) / (1024 * 1024):.2f} MB "
+                f"({media_pipeline.COMPRESS_TARGET_KBPS} kbps mono)",
+                "DEBUG",
+            )
+        else:
+            log_event(
+                log_container,
+                logs_list,
+                f"Part {idx}: sent unchanged ({len(raw_bytes) / (1024 * 1024):.2f} MB)",
+                "DEBUG",
+            )
+        encoded.append((compressed, "audio/mp3" if compressed is not raw_bytes else mime))
+        # Release the raw slice as soon as it has been transcoded.
+        all_parts[idx - 1] = (b"", mime)
 
     status_text.markdown("🔄 *Encoding audio stream to base64...*")
-    progress_bar.progress(10)
+    progress_bar.progress(30)
 
     b64_start = time.time()
-    b64_audio = base64.b64encode(audio_file_bytes).decode("utf-8")
+    b64_parts = [
+        (base64.b64encode(b).decode("utf-8"), m) for b, m in encoded
+    ]
     b64_duration = time.time() - b64_start
-    log_event(log_container, logs_list, f"Base64 complete: {len(b64_audio):,} chars in {b64_duration:.2f}s", "DEBUG")
-    progress_bar.progress(25)
+    total_b64 = sum(len(x[0]) for x in b64_parts)
+    log_event(
+        log_container,
+        logs_list,
+        f"Base64 complete: {len(b64_parts)} part(s), {total_b64:,} chars in {b64_duration:.2f}s",
+        "DEBUG",
+    )
+    progress_bar.progress(33)
+
+    order_note = (
+        "You are given "
+        + ("a single continuous recording" if len(b64_parts) == 1
+           else f"{len(b64_parts)} audio parts of the SAME meeting, "
+                "concatenated in chronological order")
+        + ". Treat the audio as ONE continuous meeting:\n"
+        "- Keep speaker labels CONSISTENT across all parts. The same person must not "
+        "receive a different 'Speaker N' label in a later part.\n"
+        "- Produce a SINGLE continuous timeline. Do NOT restart timestamps at 00:00 "
+        "for each part.\n"
+        "- Do not summarise each part separately. Produce ONE transcript and ONE set "
+        "of minutes for the meeting as a whole.\n"
+    )
 
     prompt = (
         "You are an expert executive meeting assistant. Listen carefully to this meeting audio recording:\n"
-        "1. Identify attendees with their designations/roles if mentioned in 'attendees'.\n"
+        + (order_note if len(b64_parts) > 1 else "")
+        + "1. Identify attendees with their designations/roles if mentioned in 'attendees'.\n"
         "2. Produce a full diarized transcript identifying distinct speakers.\n"
         "3. Transcribe speech verbatim in 'original_text' (preserving native language/words), "
         "and provide an accurate English translation in 'translated_text'.\n"
@@ -1414,18 +1488,14 @@ def analyze_meeting_audio_rest(
             "Content-Type": "application/json",
             "x-goog-api-key": api_key,
         }
+        # One inline_data part per file, appended in the user's chosen order.
+        media_parts = [
+            {"inline_data": {"mime_type": m, "data": d}} for d, m in b64_parts
+        ]
         payload = {
             "contents": [
                 {
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": b64_audio,
-                            }
-                        },
-                    ]
+                    "parts": [{"text": prompt}] + media_parts,
                 }
             ],
             "generationConfig": {
@@ -1439,22 +1509,19 @@ def analyze_meeting_audio_rest(
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        audio_fmt = mime_type.split("/")[-1].replace("mpeg", "mp3")
+        # One input_audio item per file, same order.
+        media_items = []
+        for d, m in b64_parts:
+            audio_fmt = m.split("/")[-1].replace("mpeg", "mp3")
+            media_items.append(
+                {"type": "input_audio", "input_audio": {"data": d, "format": audio_fmt}}
+            )
         payload = {
             "model": model_name,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": b64_audio,
-                                "format": audio_fmt,
-                            },
-                        },
-                    ],
+                    "content": [{"type": "text", "text": prompt}] + media_items,
                 }
             ],
             "response_format": {"type": "json_object"},
@@ -1625,6 +1692,8 @@ def main():
                 "active_template_bytes",
                 "converted_template_download",
                 "logs_list",
+                "audio_registry",
+                "audio_order",
             ]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -1682,14 +1751,106 @@ def main():
     # =========================================================================
     with col_left:
         st.markdown("#### 1. Upload Audio")
-        audio_file = st.file_uploader(
-            "Select meeting recording",
+        audio_files = st.file_uploader(
+            "Select meeting recording(s)",
             type=["mp3", "wav", "m4a", "ogg", "aac", "mp4"],
-            help="Supports MP3, WAV, M4A, OGG, AAC, MP4.",
+            accept_multiple_files=True,
+            help=(
+                "Supports MP3, WAV, M4A, OGG, AAC, MP4. Upload one file, or several "
+                "parts of the same meeting — they are sent to the model in the order "
+                "below and returned as one stitched report."
+            ),
             label_visibility="collapsed",
         )
-        if audio_file:
-            st.audio(audio_file)
+
+        # Serialize ALL of this session's distinct uploads, keyed by file_id.
+        # The widget re-indexes its list whenever files are added or removed, and
+        # reading a file's bytes again after that is unreliable — so hold them
+        # ourselves and key everything off the stable file_id.
+        parts: list[media_pipeline.Part] = []
+        bytes_by_key: dict[str, bytes] = {}
+        mime_by_key: dict[str, str] = {}
+
+        if audio_files:
+            st.session_state.setdefault("audio_registry", {})
+            st.session_state.setdefault("audio_order", {})
+            registry = st.session_state["audio_registry"]
+            order_map = st.session_state["audio_order"]
+
+            for f in audio_files:
+                if f.file_id not in registry:
+                    registry[f.file_id] = f.read()
+
+            # Drop bookkeeping for files the user removed, wrapped in try/except so
+            # the widget's internals can never break the main flow.
+            try:
+                live = {f.file_id for f in audio_files}
+                for dead in [k for k in list(registry) if k not in live]:
+                    registry.pop(dead, None)
+                    order_map.pop(dead, None)
+            except Exception:
+                pass
+
+            parts = media_pipeline.order_parts(
+                [
+                    media_pipeline.Part(
+                        key=f.file_id, name=f.name, size=len(registry[f.file_id])
+                    )
+                    for f in audio_files
+                ],
+                order_map,
+            )
+            # Seed a default Order for any file the user hasn't positioned yet.
+            highest = max(order_map.values(), default=0)
+            for p in parts:
+                if p.key not in order_map:
+                    highest += 1
+                    order_map[p.key] = highest
+            parts = media_pipeline.order_parts(parts, order_map)
+
+            bytes_by_key = registry
+            mime_by_key = {f.file_id: (f.type or "audio/mp3") for f in audio_files}
+
+            n = len(parts)
+            total = media_pipeline.total_bytes(parts)
+            st.caption(
+                f"🎧 **{n} part{'s' if n != 1 else ''}** • "
+                f"{media_pipeline.format_size(total)} total — played back top to bottom"
+            )
+            if n > 1:
+                st.caption(
+                    "Each part is playable and can be re-ordered. All parts are treated "
+                    "as ONE continuous meeting: they are sent to the model in this order "
+                    "and returned as a single merged transcript and minutes document."
+                )
+
+            for i, part in enumerate(parts, start=1):
+                with st.container(border=True):
+                    r_col, a_col, o_col = st.columns([0.34, 0.43, 0.23])
+                    with r_col:
+                        st.markdown(f"**{i}. {part.name}**")
+                        st.caption(media_pipeline.format_size(part.size))
+                    with a_col:
+                        st.audio(bytes_by_key[part.key])
+                    with o_col:
+                        new_pos = st.number_input(
+                            "Order",
+                            min_value=1,
+                            max_value=n,
+                            value=int(order_map.get(part.key, i)),
+                            step=1,
+                            key=f"pos_{part.key}",
+                            label_visibility="collapsed",
+                        )
+                        if int(new_pos) != int(order_map.get(part.key, i)):
+                            order_map[part.key] = int(new_pos)
+                            st.rerun()
+
+            ok, msg = media_pipeline.validate_batch(
+                [p.size for p in parts], media_pipeline.MAX_TOTAL_MB
+            )
+            if not ok:
+                st.error(f"⚠️ {msg}")
 
         st.markdown("#### 2. Meeting Document Template")
         doc_choice = st.radio(
@@ -1798,16 +1959,29 @@ def main():
                 st.error("Missing API Key. Open ⚙️ Settings in header.")
                 return
 
-            if not audio_file:
-                st.error("Please upload an audio file in Step 1.")
+            if not audio_files:
+                st.error("Please upload at least one audio file in Step 1.")
+                return
+
+            batch_ok, batch_msg = media_pipeline.validate_batch(
+                [len(bytes_by_key[p.key]) for p in parts], media_pipeline.MAX_TOTAL_MB
+            )
+            if not batch_ok:
+                st.error(f"⚠️ {batch_msg}")
                 return
 
             st.session_state["logs_list"] = []
             log_event(log_container, st.session_state["logs_list"], "Execution initialized...", "INFO")
 
             try:
-                audio_bytes = audio_file.read()
-                mime = audio_file.type if audio_file.type else "audio/mp3"
+                # parts is already in play order (natural sort, then user overrides).
+                first = parts[0]
+                audio_bytes = bytes_by_key[first.key]
+                mime = mime_by_key.get(first.key, "audio/mp3")
+                extra = [
+                    (bytes_by_key[p.key], mime_by_key.get(p.key, "audio/mp3"))
+                    for p in parts[1:]
+                ]
 
                 report, usage_metrics = analyze_meeting_audio_rest(
                     audio_file_bytes=audio_bytes,
@@ -1819,6 +1993,7 @@ def main():
                     status_text=status_text,
                     log_container=log_container,
                     logs_list=st.session_state["logs_list"],
+                    extra_parts=extra,
                 )
 
                 if report:
