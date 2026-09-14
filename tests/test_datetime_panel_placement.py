@@ -128,7 +128,88 @@ def test_an_undated_report_renders_without_crashing():
 
 
 def test_an_undated_report_warns_rather_than_silently_guessing():
-    """Falling back to today is a guess; the user must know it was a guess."""
+    """Item 1 writes today into the data, which makes the guess real — so the
+    warning is now MORE important, not less. Writing a default into the data
+    without saying so would turn a visible placeholder into an invisible edit.
+
+    Warning text and its gate both live in app.py; the render probe below proves
+    the warning actually fires.
+    """
     src = open(os.path.join(ROOT, "app.py"), encoding="utf-8").read()
-    assert "Defaulted to today" in src, "expected an explicit warning on unreadable dates"
+    assert "did not yield a readable date" in src, "expected an explicit warning on unreadable dates"
     assert re.search(r"if _date_unreadable:", src), "the warning must be conditional"
+    assert "date_defaulted_from" in src, (
+        "the assumed date must be recorded so the panel can explain itself"
+    )
+    assert re.search(r"st\.session_state\.pop\(\"date_defaulted_from\", None\)", src), (
+        "the warning must be cleared once the user explicitly saves a date"
+    )
+
+
+def test_the_undated_warning_actually_fires_on_screen():
+    """A source-string assertion is not evidence the user sees it."""
+    import json
+    import subprocess
+
+    probe = r"""
+import json, os, sys
+from streamlit.testing.v1 import AppTest
+at = AppTest.from_file(sys.argv[1], default_timeout=120)
+at.secrets["API_KEY"] = "dummy-not-a-real-secret"
+at.run()
+os.environ["API_KEY"] = "dummy-not-a-real-secret"
+from streamlit.runtime.secrets import Secrets
+Secrets._parse = lambda self: {}
+sys.path.insert(0, sys.argv[2])
+import app as _app
+report = _app.MeetingMinutesReport(
+    title="T", date="Undated", meeting_time="",
+    attendees=[_app.Attendee(name="A", designation="B")],
+    transcript=[_app.TranscriptEntry(speaker="S", translated_text="x")],
+)
+at.session_state["meeting_result"] = report
+at.run()
+print(json.dumps({"warnings": [str(w.value) for w in at.warning]}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", probe, os.path.join(ROOT, "app.py"), ROOT],
+        capture_output=True, text=True, timeout=420, cwd=ROOT,
+    )
+    assert proc.returncode == 0, f"probe failed:\n{proc.stderr[-2500:]}"
+    warnings = json.loads(proc.stdout.strip().splitlines()[-1])["warnings"]
+    assert warnings, "an undated report silently shows a date with no warning"
+    assert any("readable date" in w for w in warnings), warnings
+
+
+def test_a_report_with_a_real_date_shows_no_warning():
+    """The warning must not become permanent noise on every healthy run."""
+    import json
+    import subprocess
+
+    probe = r"""
+import json, os, sys
+from streamlit.testing.v1 import AppTest
+at = AppTest.from_file(sys.argv[1], default_timeout=120)
+at.secrets["API_KEY"] = "dummy-not-a-real-secret"
+at.run()
+os.environ["API_KEY"] = "dummy-not-a-real-secret"
+from streamlit.runtime.secrets import Secrets
+Secrets._parse = lambda self: {}
+sys.path.insert(0, sys.argv[2])
+import app as _app
+report = _app.MeetingMinutesReport(
+    title="T", date="12 September 2026", meeting_time="10:00",
+    attendees=[_app.Attendee(name="A", designation="B")],
+    transcript=[_app.TranscriptEntry(speaker="S", translated_text="x")],
+)
+at.session_state["meeting_result"] = report
+at.run()
+print(json.dumps({"warnings": [str(w.value) for w in at.warning]}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", probe, os.path.join(ROOT, "app.py"), ROOT],
+        capture_output=True, text=True, timeout=420, cwd=ROOT,
+    )
+    assert proc.returncode == 0, f"probe failed:\n{proc.stderr[-2500:]}"
+    warnings = json.loads(proc.stdout.strip().splitlines()[-1])["warnings"]
+    assert warnings == [], f"a readable date must not warn: {warnings}"
