@@ -4,6 +4,33 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.3 — Editable attendee roster, corrected date handling
+
+### Added
+- **Editable Attendee Roster.** The Attendees tab was a read-only grid; it is now
+  an editor — rename, correct designations, add and delete rows, then save. Edits
+  write through to the report data, so they reach the on-screen header, the
+  standard DOCX, and a custom template's `{{ attendee.name }}` /
+  `{{ attendee.designation }}` placeholders.
+- **Meeting start time in the header.** The results header now reads
+  `📅 Date: … | 🕐 Time: … | 👥 Attendees: …`. The time is omitted entirely when
+  the transcript yielded none, rather than leaving a dangling `Time:` label.
+
+### Fixed
+- **Renaming a speaker no longer leaves the old label in the attendee list.**
+  `apply_speaker_replacements` only *appended* the confirmed name, so a report
+  whose roster read `Speaker 1, Speaker 2` ended up as
+  `Speaker 1, Speaker 2, Ayesha Khan, …` — the exact labels the user had just
+  replaced. The roster row is now renamed **in place**, which also carries the
+  existing designation across instead of resetting it to `Participant`, and
+  duplicates created by renaming to a name already on the roster are collapsed.
+- **The date default now reaches the data and the download.** The Date & Start
+  Time panel *showed* today for an undated report, but that was only the widget's
+  default — `report.date` still said `Undated`, so the header and the downloaded
+  `.docx` contradicted the panel. Today is now written into the report data. A
+  date the transcript genuinely supplied (including a verbose `12 September
+  2026`) is left byte-for-byte untouched.
+
 ## v0.2.1 — Editable meeting date & start time
 
 ### Added

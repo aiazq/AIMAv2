@@ -62,7 +62,7 @@ def test_app_exposes_a_version_constant():
 def test_version_is_the_current_release():
     """Pins the release. Bumping APP_VERSION without updating this is a deliberate
     two-file edit, so a version bump can never be accidental."""
-    assert app.APP_VERSION == "v0.2.1"
+    assert app.APP_VERSION == "v0.3"
 
 
 def test_version_is_not_duplicated_as_a_literal():
@@ -88,18 +88,23 @@ def test_version_is_not_duplicated_as_a_literal():
 
 
 def test_the_version_appears_on_the_page():
+    """Reads app.APP_VERSION rather than a literal, so a release bump does not
+    break the test — and the assertion still pins the page to the constant."""
     rendered = _render()
     assert not rendered["exceptions"], rendered["exceptions"]
     visible = " ".join(rendered["captions"] + rendered["markdown"])
-    assert "v0.2" in visible, f"version not rendered. captions={rendered['captions']}"
+    assert app.APP_VERSION in visible, (
+        f"{app.APP_VERSION} not rendered. captions={rendered['captions']}"
+    )
 
 
 def test_the_version_is_rendered_as_small_text():
     """Requested as 'small text' — a caption or a small-styled element, not a heading."""
     rendered = _render()
-    in_caption = any("v0.2" in c for c in rendered["captions"])
+    v = app.APP_VERSION
+    in_caption = any(v in c for c in rendered["captions"])
     in_small_markdown = any(
-        "v0.2" in m and ("<small" in m or "font-size" in m)
+        v in m and ("<small" in m or "font-size" in m)
         for m in rendered["markdown"]
     )
     assert in_caption or in_small_markdown, (
@@ -111,7 +116,7 @@ def test_the_version_is_rendered_as_small_text():
 def test_the_version_is_not_a_heading():
     rendered = _render()
     for m in rendered["markdown"]:
-        if "v0.2" in m:
+        if app.APP_VERSION in m:
             assert not re.search(r"^#{1,6}\s", m.strip()), f"version must not be a heading: {m!r}"
 
 

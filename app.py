@@ -176,7 +176,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.2.1"
+APP_VERSION = "v0.3"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1845,11 +1845,35 @@ def apply_speaker_replacements(report: MeetingMinutesReport, name_map: dict[str,
             if new_spk.strip() and old_spk.lower() in ai.owner.lower():
                 ai.owner = ai.owner.replace(old_spk, new_spk.strip())
 
-    existing_attendee_names = {a.name for a in updated.attendees}
+    # Rename the roster row IN PLACE rather than appending beside it. The roster is
+    # populated from the diarization labels, so appending left the old "Speaker 1"
+    # row on the page next to the confirmed name — the bug where the attendee list
+    # kept showing "Speaker 1, Speaker 2" after a rename. Renaming in place also
+    # carries the existing designation across, which an append could not do.
+    for attendee in updated.attendees:
+        replacement = name_map.get(attendee.name, "").strip()
+        if replacement:
+            attendee.name = replacement
+
+    # Collapse duplicates this may have created (renaming to a name already on the
+    # roster). Case-insensitive, first spelling wins.
+    seen: set[str] = set()
+    deduped: list[Attendee] = []
+    for attendee in updated.attendees:
+        key = attendee.name.strip().lower()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(attendee)
+    updated.attendees = deduped
+
+    # A confirmed speaker with no roster row at all is still added.
+    existing_attendee_names = {a.name.strip().lower() for a in updated.attendees}
     for old_spk, new_spk in name_map.items():
-        if new_spk.strip() and new_spk.strip() not in existing_attendee_names:
-            updated.attendees.append(Attendee(name=new_spk.strip(), designation="Participant"))
-            existing_attendee_names.add(new_spk.strip())
+        confirmed = new_spk.strip()
+        if confirmed and confirmed.lower() not in existing_attendee_names:
+            updated.attendees.append(Attendee(name=confirmed, designation="Participant"))
+            existing_attendee_names.add(confirmed.lower())
 
     return updated
 
@@ -1874,6 +1898,74 @@ def apply_datetime_overrides(
         updated.date = format_report_date(new_date)
     if new_time is not None:
         updated.meeting_time = format_report_time(new_time)
+    return updated
+
+
+def ensure_report_date(
+    report: MeetingMinutesReport,
+    today: datetime.date | None = None,
+) -> MeetingMinutesReport:
+    """Return a copy of `report` whose `date` is a real date, never "Undated".
+
+    The panel's widget already *shows* today — but `st.date_input(value=...)` only
+    sets the widget, leaving `report.date` as the model's "Undated". The header and
+    the downloaded .docx read `report.date`, so they kept saying "Undated" while the
+    panel showed a date. This writes the fallback into the DATA so all three agree.
+
+    Only an unreadable/blank date is replaced: a date the transcript genuinely
+    provided (including a verbose one like "12 September 2026") is left byte-for-byte
+    alone, because silently reformatting a value the user never asked to change is
+    its own defect.
+    """
+    updated = report.model_copy(deep=True)
+    if parse_report_date(updated.date) is None:
+        updated.date = format_report_date(today or datetime.date.today())
+    return updated
+
+
+def _clean_cell(value) -> str:
+    """Coerce one edited grid cell to a trimmed string.
+
+    A cleared cell arrives as NaN/None, never as "" — and `str(float('nan'))` is the
+    literal string "nan" (verified: `_clean_str(float('nan')) -> 'nan'`), which would
+    print the word "nan" into the downloaded minutes. Every null-ish representation is
+    treated as empty instead.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:  # NaN
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "<na>", "nat", "none"} else text
+
+
+def apply_attendee_roster(
+    report: MeetingMinutesReport,
+    rows,
+) -> MeetingMinutesReport:
+    """Return a copy of `report` with the attendee roster replaced by `rows`.
+
+    The roster is the source of truth for the on-screen Attendees tab, the
+    `{{ attendee.name }}` / `{{ attendee.designation }}` placeholders of a custom
+    template, and the default DOCX table — all read `report.attendees`, so writing
+    here reaches every consumer at once.
+
+    Rows that are entirely blank are dropped: `num_rows="dynamic"` leaves a trailing
+    empty row behind after an edit, and keeping it would add a nameless attendee to
+    the minutes. A row with only a name or only a designation is kept.
+    """
+    updated = report.model_copy(deep=True)
+    cleaned: list[Attendee] = []
+    for row in rows or []:
+        if hasattr(row, "get"):
+            name = _clean_cell(row.get("name"))
+            designation = _clean_cell(row.get("designation"))
+        else:  # a bare string row, if the editor ever hands one back
+            name, designation = _clean_cell(row), ""
+        if not name and not designation:
+            continue
+        cleaned.append(Attendee(name=name, designation=designation))
+    updated.attendees = cleaned
     return updated
 
 
@@ -2345,13 +2437,35 @@ def main():
             )
         else:
             result: MeetingMinutesReport = st.session_state["meeting_result"]
+            # Item 1: the panel shows today for an undated report, so write that
+            # default into the data too — otherwise the header and the .docx keep
+            # saying "Undated" while the panel displays a date.
+            #
+            # Record what it was BEFORE defaulting: substituting a guess silently
+            # is the same defect class as a silently-substituted schema default,
+            # so the panel still needs to surface that the value was assumed. The
+            # flag is set before the panel renders below, and survives reruns
+            # until the user explicitly saves a date of their own.
+            _raw_date = result.date
+            result = ensure_report_date(result)
+            if parse_report_date(_raw_date) is None and (_raw_date or "").strip():
+                st.session_state["date_defaulted_from"] = _raw_date
+            st.session_state["meeting_result"] = result
             active_template = st.session_state.get("saved_template_bytes")
 
             t_col1, t_col2 = st.columns([0.65, 0.35])
             with t_col1:
                 st.markdown(f"## {result.title}")
                 attendee_names = [a.name for a in result.attendees]
-                st.caption(f"📅 **Date:** {result.date} | 👥 **Attendees:** {', '.join(attendee_names)}")
+                # Item 4: start time follows the date in the header. Omitted
+                # entirely when there is none, so the line never ends in a
+                # dangling "Time:" label.
+                _header_bits = [f"📅 **Date:** {result.date}"]
+                if (result.meeting_time or "").strip():
+                    _header_bits.append(f"🕐 **Time:** {result.meeting_time.strip()}")
+                if attendee_names:
+                    _header_bits.append(f"👥 **Attendees:** {', '.join(attendee_names)}")
+                st.caption(" | ".join(_header_bits))
             with t_col2:
                 template_used = False
                 if active_template:
@@ -2390,7 +2504,10 @@ def main():
             _today = datetime.date.today()
             _parsed_date = parse_report_date(result.date, fallback=_today)
             _parsed_time = parse_report_time(result.meeting_time, fallback=datetime.time(9, 0))
-            _date_unreadable = parse_report_date(result.date) is None and bool((result.date or "").strip())
+            # The transcript's own date could not be read, so the value shown (and
+            # already written into the data above) is a guess. Surfaced, never silent.
+            _assumed_from = st.session_state.get("date_defaulted_from")
+            _date_unreadable = bool(_assumed_from)
 
             with st.expander(
                 f"📅 Meeting Date & Start Time — {result.date.strip() or 'not set'}"
@@ -2399,8 +2516,8 @@ def main():
             ):
                 if _date_unreadable:
                     st.warning(
-                        f"The transcript did not yield a readable date (`{result.date}`). "
-                        "Defaulted to today — please confirm."
+                        f"The transcript did not yield a readable date (`{_assumed_from}`). "
+                        f"Defaulted to **{result.date}** — please confirm, or correct it below."
                     )
 
                 with st.form("datetime_form"):
@@ -2421,6 +2538,9 @@ def main():
                         st.session_state["meeting_result"] = apply_datetime_overrides(
                             result, chosen_date, chosen_time
                         )
+                        # The user has now confirmed a date explicitly, so the
+                        # "we assumed this" warning must not keep firing.
+                        st.session_state.pop("date_defaulted_from", None)
                         st.rerun()
 
             # Speaker Mapping Component
@@ -2485,10 +2605,30 @@ def main():
 
             with tab_attendees:
                 st.markdown("### Attendee Roster")
-                if result.attendees:
-                    st.dataframe([a.model_dump() for a in result.attendees], use_container_width=True)
-                else:
-                    st.info("No attendees recorded.")
+                # Editable roster (item 5). Writes through `apply_attendee_roster`, so
+                # an edit reaches the header, the default DOCX table, and a custom
+                # template's {{ attendee.name }} placeholders — not just this grid.
+                # A form keeps the edit from re-running the page on every keystroke.
+                st.caption(
+                    "Edit names and designations, add or delete rows, then save. "
+                    "Changes apply to the minutes header and every downloaded document."
+                )
+                with st.form("attendee_roster_form"):
+                    edited_rows = st.data_editor(
+                        [a.model_dump() for a in result.attendees] or [{"name": "", "designation": ""}],
+                        num_rows="dynamic",
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "name": st.column_config.TextColumn("Name", width="medium"),
+                            "designation": st.column_config.TextColumn("Designation", width="medium"),
+                        },
+                        key="attendee_roster_editor",
+                    )
+                    if st.form_submit_button("💾 Save Attendee Roster", use_container_width=True):
+                        rows = edited_rows.to_dict("records") if hasattr(edited_rows, "to_dict") else edited_rows
+                        st.session_state["meeting_result"] = apply_attendee_roster(result, rows)
+                        st.rerun()
 
             with tab_transcript:
                 view_mode = st.radio(
