@@ -14,7 +14,7 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docxtpl import DocxTemplate
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import media_pipeline
 
@@ -227,19 +227,70 @@ FUNNY_QUIPS = [
 # -----------------------------------------------------------------------------
 # Data Schemas
 # -----------------------------------------------------------------------------
+def _clean_str(value, default=""):
+    """Coerce anything the model might emit for a text field into a string."""
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return " ".join(str(v) for v in value.values())
+    return value if isinstance(value, str) else str(value)
+
+
+def _normalize(data, str_fields=(), list_fields=()):
+    """Normalise one item of model output before validation.
+
+    A key present with an explicit null is REMOVED so the field's own default
+    applies (rather than being flattened to ""). This matters for fields whose
+    default is meaningful, e.g. date -> 'Undated'.
+    """
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    for k in str_fields:
+        if k not in data:
+            continue
+        if data[k] is None:
+            data.pop(k)
+        else:
+            data[k] = _clean_str(data[k], "")
+    for k in list_fields:
+        if k not in data:
+            continue
+        v = data.pop(k) if data[k] is None else data[k]
+        if v is None:
+            continue
+        if isinstance(v, str):
+            data[k] = [v]
+        elif isinstance(v, dict):
+            data[k] = [v]
+        elif isinstance(v, (list, tuple)):
+            data[k] = list(v)
+    return data
+
+
 class Attendee(BaseModel):
-    name: str = Field(description="Full name of attendee.")
+    name: str = Field(default="", description="Full name of attendee.")
     designation: str = Field(default="", description="Role or title if mentioned, otherwise empty.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        return _normalize(data, str_fields=("name", "designation"))
+
+    model_config = {"extra": "ignore"}
 
 
 class ActionItem(BaseModel):
     task: str = Field(
+        default="",
         description=("Description of the action item or task, i.e. the work being "
                      "tracked (the 'Agenda Items' column of a minutes table)."),
     )
-    owner: str = Field(description="Person, role, or team assigned to this task.")
+    owner: str = Field(default="", description="Person, role, or team assigned to this task.")
     department: str = Field(default="", description="Relevant department or team if identifiable.")
-    deadline: str = Field(description="Due date, timeframe, or 'TBD' if unspecified.")
+    deadline: str = Field(default="", description="Due date, timeframe, or 'TBD' if unspecified.")
     remarks: str = Field(
         default="",
         description="Priority (High/Medium/Low) and any other remarks for this item.",
@@ -254,45 +305,149 @@ class ActionItem(BaseModel):
             return data.get("priority", "") or ""
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        return _normalize(
+            data, str_fields=("task", "owner", "department", "deadline")
+        )
+
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
 
 class TranscriptEntry(BaseModel):
-    speaker: str = Field(description="Name or label of the speaker.")
-    timestamp: str = Field(description="Approximate timestamp (e.g., '01:23') or empty string.")
-    original_text: str = Field(description="Speech in original spoken language.")
-    translated_text: str = Field(description="Accurate English translation (same as original if already English).")
+    """One diarized transcript segment.
+
+    Every field is optional on input and coerced to a string. The model is asked
+    for all four, but a long transcript occasionally omits `translated_text` on a
+    single segment or emits an explicit null — and a required field then rejected
+    the ENTIRE report after the provider call had already succeeded, discarding
+    minutes of audio work over one missing key.
+
+    A missing translation falls back to the original text so the segment still
+    renders (and is visibly untranslated), rather than silently disappearing.
+    """
+
+    speaker: str = Field(default="Unknown speaker", description="Name or label of the speaker.")
+    timestamp: str = Field(default="", description="Approximate timestamp (e.g., '01:23') or empty string.")
+    original_text: str = Field(default="", description="Speech in original spoken language.")
+    translated_text: str = Field(default="", description="Accurate English translation (same as original if already English).")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_missing_text(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        def _s(key):
+            v = data.get(key)
+            if v is None:
+                return ""
+            if isinstance(v, (list, tuple)):
+                return " ".join(str(x) for x in v)
+            return v if isinstance(v, str) else str(v)
+
+        data = dict(data)
+        original = _s("original_text")
+        translated = _s("translated_text")
+        if not original and translated:
+            original = translated
+        if not translated and original:
+            translated = original
+        data["original_text"] = original
+        data["translated_text"] = translated
+
+        sp = data.get("speaker")
+        if sp is None or (isinstance(sp, str) and not sp.strip()):
+            data["speaker"] = "Unknown speaker"
+        elif not isinstance(sp, str):
+            data["speaker"] = str(sp)
+
+        ts = data.get("timestamp")
+        if ts is None:
+            data["timestamp"] = ""
+        elif not isinstance(ts, str):
+            data["timestamp"] = str(ts)
+        return data
+
+    model_config = {"extra": "ignore"}
 
 
 class AgendaItem(BaseModel):
-    topic: str = Field(description="Agenda topic discussed.")
-    discussion_summary: str = Field(description="Summary of discussions regarding this topic.")
-    decisions_made: list[str] = Field(description="Key conclusions reached.")
+    topic: str = Field(default="", description="Agenda topic discussed.")
+    discussion_summary: str = Field(default="", description="Summary of discussions regarding this topic.")
+    decisions_made: list[str] = Field(default_factory=list, description="Key conclusions reached.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        data = _normalize(
+            data, str_fields=("topic", "discussion_summary"), list_fields=("decisions_made",)
+        )
+        if isinstance(data, dict) and "decisions_made" in data:
+            data["decisions_made"] = [
+                _clean_str(d) for d in data["decisions_made"] if d is not None
+            ]
+        return data
+
+    model_config = {"extra": "ignore"}
 
 
 class DetectedSpeaker(BaseModel):
-    speaker_id: str = Field(description="Unique label used in transcription, e.g., 'Speaker 1'.")
-    inferred_name: str = Field(description="Inferred full or first name, or 'Unknown'.")
+    speaker_id: str = Field(default="", description="Unique label used in transcription, e.g., 'Speaker 1'.")
+    inferred_name: str = Field(default="", description="Inferred full or first name, or 'Unknown'.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        return _normalize(data, str_fields=("speaker_id", "inferred_name"))
+
+    model_config = {"extra": "ignore"}
 
 
 class MeetingMinutesReport(BaseModel):
-    title: str = Field(description="Descriptive title for the meeting.")
-    date: str = Field(description="Date of the meeting or 'Undated'.")
+    """The single stitched output of a run.
+
+    Container fields are optional with empty defaults. The model occasionally
+    omits a whole section, and a required container rejected the entire report
+    after the provider call had already succeeded — losing all of the work.
+    """
+
+    title: str = Field(default="", description="Descriptive title for the meeting.")
+    date: str = Field(default="Undated", description="Date of the meeting or 'Undated'.")
     meeting_time: str = Field(default="", description="Meeting time range if mentioned.")
     minute_taker: str = Field(default="", description="Minute taker(s) if specified.")
-    attendees: list[Attendee] = Field(description="Detected participants with designations.")
+    attendees: list[Attendee] = Field(default_factory=list, description="Detected participants with designations.")
     detected_speakers: list[DetectedSpeaker] = Field(
         default_factory=list,
         description="List of detected speakers and any names inferred from introductions or dialog.",
     )
-    executive_summary: str = Field(description="Executive summary of the meeting in English.")
-    agenda_and_decisions: list[AgendaItem] = Field(description="Topic breakdowns and decisions in English.")
-    action_items: list[ActionItem] = Field(description="Action items extracted in English.")
+    executive_summary: str = Field(default="", description="Executive summary of the meeting in English.")
+    agenda_and_decisions: list[AgendaItem] = Field(default_factory=list, description="Topic breakdowns and decisions in English.")
+    action_items: list[ActionItem] = Field(default_factory=list, description="Action items extracted in English.")
     next_meeting_date: str = Field(default="TBD", description="Date of the next meeting if agreed.")
     next_meeting_time: str = Field(default="TBD", description="Time of next meeting if agreed.")
     next_meeting_agenda_focus: str = Field(default="", description="Agenda focus of upcoming meeting.")
     closing_remarks: str = Field(default="The meeting was concluded.", description="Meeting closing statement.")
-    transcript: list[TranscriptEntry] = Field(description="Bilingual speaker-diarized transcript.")
+    transcript: list[TranscriptEntry] = Field(default_factory=list, description="Bilingual speaker-diarized transcript.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        return _normalize(
+            data,
+            str_fields=(
+                "title", "date", "meeting_time", "minute_taker", "executive_summary",
+                "next_meeting_date", "next_meeting_time", "next_meeting_agenda_focus",
+                "closing_remarks",
+            ),
+            list_fields=(
+                "attendees", "detected_speakers", "agenda_and_decisions",
+                "action_items", "transcript",
+            ),
+        )
+
+    model_config = {"extra": "ignore"}
 
 
 # AI Semantic Transformation Schemas
@@ -1470,6 +1625,10 @@ def analyze_meeting_audio_rest(
         "2. Produce a full diarized transcript identifying distinct speakers.\n"
         "3. Transcribe speech verbatim in 'original_text' (preserving native language/words), "
         "and provide an accurate English translation in 'translated_text'.\n"
+        "   CRITICAL: every transcript entry MUST include ALL FOUR keys — speaker, timestamp, "
+        "original_text, translated_text. Never omit a key and never emit null. Long "
+        "transcripts are where this slips: before returning, verify that the FINAL entries "
+        "carry all four keys, not just the early ones.\n"
         "4. Listen for verbal introductions, greetings, or names addressed in conversation to infer the real name of each speaker in 'detected_speakers'.\n"
         "5. Generate a comprehensive English executive summary.\n"
         "6. List all topics and decisions made in English.\n"
@@ -1620,6 +1779,30 @@ def analyze_meeting_audio_rest(
 
     parsed_data = json.loads(cleaned_json.strip())
     report = MeetingMinutesReport(**parsed_data)
+
+    # Surface any segment the model under-delivered on, rather than silently
+    # substituting a fallback. A run where this is non-zero is a degraded
+    # response, not a clean one — the user should know which segments to re-read.
+    try:
+        repaired = [
+            i for i, (raw, entry) in enumerate(
+                zip(parsed_data.get("transcript") or [], report.transcript)
+            )
+            if isinstance(raw, dict)
+            and (not raw.get("translated_text") or not raw.get("original_text"))
+        ]
+        if repaired:
+            log_event(
+                log_container,
+                logs_list,
+                f"Repaired {len(repaired)} transcript segment(s) the model returned "
+                f"incomplete (index: {', '.join(str(i) for i in repaired[:10])}"
+                f"{', …' if len(repaired) > 10 else ''}) — a missing translation falls "
+                "back to the original text",
+                "WARN",
+            )
+    except Exception:
+        pass
 
     tok_per_sec = (completion_tokens / latency) if latency > 0 and completion_tokens > 0 else 0
 
