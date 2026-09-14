@@ -17,6 +17,7 @@ from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import media_pipeline
+import timeline
 
 # -----------------------------------------------------------------------------
 # Configuration & Styling
@@ -176,7 +177,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.3"
+APP_VERSION = "v0.4"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1882,23 +1883,69 @@ def apply_datetime_overrides(
     report: MeetingMinutesReport,
     new_date: datetime.date | None,
     new_time: datetime.time | None,
+    duration_seconds: float | None = None,
 ) -> MeetingMinutesReport:
     """Return a copy of `report` with the meeting date and/or start time replaced.
 
     The document already carries these fields, so overriding them here reaches
     every consumer — the on-screen header, the default DOCX, and a custom Jinja
     template's `{{ date }}` / `{{ meeting_time }}` — without touching the
-    transcript or any other content.
+    transcript's text or any other content.
 
     A `None` argument means "leave this field alone", which is how the caller
     distinguishes "the user cleared the widget" from "the user did not touch it".
+
+    The START TIME also anchors every transcript entry. The model returns ELAPSED
+    OFFSETS from the start of the recording ("00:21"), not times of day, and the
+    screen, the DOCX, the template context and the JSON export all read
+    `entry.timestamp` — so writing the clock time here fixes all four at once.
+    Without a readable start time the offsets are left alone: defaulting to 09:00
+    would stamp a fabricated clock time across the whole minutes.
     """
     updated = report.model_copy(deep=True)
     if new_date is not None:
         updated.date = format_report_date(new_date)
     if new_time is not None:
         updated.meeting_time = format_report_time(new_time)
+        _anchor_transcript(updated, new_time, duration_seconds)
     return updated
+
+
+def _anchor_transcript(
+    report: MeetingMinutesReport,
+    start: datetime.time,
+    duration_seconds: float | None = None,
+) -> None:
+    """Rewrite each transcript entry's `timestamp` as a clock time, in place.
+
+    The entry's ORIGINAL offset is remembered on the model (in a private
+    attribute, so it never reaches `model_dump()` or the JSON schema). Re-anchoring
+    then works from that original rather than from the value just written —
+    otherwise saving a second time would add the offset twice.
+
+    An entry whose offset cannot be read keeps the model's raw value: showing
+    something we could not parse is honest, stamping a guess is not.
+    """
+    entries = list(getattr(report, "transcript", None) or [])
+    if not entries:
+        return
+
+    offsets = []
+    for entry in entries:
+        original = getattr(entry, "_source_timestamp", None)
+        if original is None:
+            original = entry.timestamp
+            try:
+                entry._source_timestamp = original
+            except (AttributeError, ValueError):
+                # A model that refuses the private attr simply loses idempotency;
+                # it must never break the render.
+                pass
+        offsets.append(original)
+
+    anchored = timeline.anchor(offsets, start, duration_seconds=duration_seconds)
+    for entry, stamp in zip(entries, anchored):
+        entry.timestamp = stamp
 
 
 def ensure_report_date(
@@ -2387,6 +2434,19 @@ def main():
                     for p in parts[1:]
                 ]
 
+                # Measure the recording so the transcript's elapsed offsets can
+                # be placed on the clock at the right scale (MM:SS vs HH:MM).
+                # Best-effort: an unmeasurable file leaves the scale at its
+                # documented fallback rather than inventing a duration.
+                _durations = [
+                    timeline.probe_duration(
+                        bytes_by_key[p.key],
+                        os.path.splitext(p.name)[1],
+                    )
+                    for p in parts
+                ]
+                st.session_state["audio_duration_seconds"] = timeline.total_duration(_durations)
+
                 report, usage_metrics = analyze_meeting_audio_rest(
                     audio_file_bytes=audio_bytes,
                     mime_type=mime,
@@ -2501,9 +2561,14 @@ def main():
             # accepts — so both values are parsed defensively before being used as
             # widget defaults, and a value that cannot be read falls back to today
             # with an explicit warning rather than crashing the render.
+            # `_parsed_time` is the widget default; it is deliberately a FALLBACK
+            # (09:00) and is distinguishable from a real value by the caller, so a
+            # blank/unreadable meeting_time does not silently become 09:00 in the
+            # transcript — see the warning below.
             _today = datetime.date.today()
             _parsed_date = parse_report_date(result.date, fallback=_today)
             _parsed_time = parse_report_time(result.meeting_time, fallback=datetime.time(9, 0))
+            _time_unreadable = parse_report_time(result.meeting_time) is None
             # The transcript's own date could not be read, so the value shown (and
             # already written into the data above) is a guess. Surfaced, never silent.
             _assumed_from = st.session_state.get("date_defaulted_from")
@@ -2519,6 +2584,14 @@ def main():
                         f"The transcript did not yield a readable date (`{_assumed_from}`). "
                         f"Defaulted to **{result.date}** — please confirm, or correct it below."
                     )
+                if _time_unreadable:
+                    st.warning(
+                        "The transcript did not yield a readable start time, so the "
+                        "transcript entries still show the model's **elapsed offsets** "
+                        "(e.g. `00:21` = 21 s into the recording) rather than clock "
+                        "times. Set a start time below and save to place every entry "
+                        "on the clock."
+                    )
 
                 with st.form("datetime_form"):
                     d_col, t_col = st.columns(2)
@@ -2531,12 +2604,18 @@ def main():
                         chosen_time = st.time_input(
                             "Meeting Start Time", value=_parsed_time, key="meeting_time_input",
                             step=datetime.timedelta(minutes=1),
-                            help="Start time of the meeting. Applied to the header and exports.",
+                            help=(
+                                "Start time of the meeting. Applied to the header and used to "
+                                "convert each transcript entry's elapsed offset into a clock time."
+                            ),
                         )
 
                     if st.form_submit_button("💾 Save Date & Time", use_container_width=True):
                         st.session_state["meeting_result"] = apply_datetime_overrides(
-                            result, chosen_date, chosen_time
+                            result,
+                            chosen_date,
+                            None if _time_unreadable and not chosen_time else chosen_time,
+                            duration_seconds=st.session_state.get("audio_duration_seconds"),
                         )
                         # The user has now confirmed a date explicitly, so the
                         # "we assumed this" warning must not keep firing.

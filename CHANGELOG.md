@@ -4,6 +4,42 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.4 — Transcript entries now show real clock times
+
+### Fixed
+- **Meeting minutes no longer read `00:00`.** The model returns **elapsed offsets**
+  from the start of the recording (`00:21` = 21 s in), not times of day. The app
+  rendered `entry.timestamp` verbatim, so every entry read `00:00`-relative no
+  matter when the meeting actually began. Each entry is now anchored to the Start
+  Time as a real clock time (`10:00:21`) — which answers "who said what, and at
+  what time".
+- **The correction reaches every consumer at once.** The screen, the standard
+  DOCX, a custom template's `{{ transcript }}` context and the JSON export all
+  read the same `entry.timestamp` field, so anchoring it inside
+  `apply_datetime_overrides` fixes all four together — the downloadable document
+  included. Previously the override touched only `date` / `meeting_time`.
+
+### Added
+- **Transcript offset scale detection.** A two-field offset (`02:15`) is
+  ambiguous — 2 min 15 s or 2 h 15 min. The scale is now decided per transcript:
+  a leading field above 59 forces HH:MM, and otherwise the recording's measured
+  duration decides. A 2.5 h meeting's `02:15` lands at 11:15, not 135 s in.
+  Multi-part uploads are summed, because their offsets span the whole meeting.
+- **`timeline.py`** — the offset→clock arithmetic, Streamlit-free and unit tested
+  (`tests/test_transcript_timeline.py`, `tests/test_audio_duration.py`).
+- **Warnings instead of silent guesses.** When the transcript yields no readable
+  start time the entries keep the model's raw offsets, and the panel explains
+  why — defaulting to 09:00 would stamp a fabricated clock time across the whole
+  minutes.
+
+### Notes
+- Changing the Start Time moves every entry without drifting: each entry's
+  original offset is remembered, so re-saving recomputes from the original
+  rather than adding the offset a second time.
+- `tests/falsify_v031.sh` re-introduces 13 known bugs one at a time and confirms
+  the suite catches every one. Each test in this release has been observed to
+  fail for the right reason.
+
 ## v0.3 — Editable attendee roster, corrected date handling
 
 ### Added
