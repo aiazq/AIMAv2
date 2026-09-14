@@ -131,3 +131,33 @@ def test_the_transcript_module_is_a_single_shared_implementation():
         f"clock-time formatting is implemented in {impls}; it must live only in "
         f"timeline.py so screen, DOCX and export cannot diverge."
     )
+
+
+# ---------------------------------------------------------------------------
+# A fresh run anchors without the user touching the panel
+# ---------------------------------------------------------------------------
+def test_the_render_path_anchors_the_transcript():
+    """`apply_datetime_overrides` only runs when the user saves the panel, so a
+    new run would show 00:00-relative times until they did. The render path must
+    anchor on its own — the panel is a correction tool, not a prerequisite."""
+    calls = _calls_to(_app_tree(), "auto_anchor_transcript")
+    # One definition-site call check: it must be CALLED, not merely defined.
+    assert calls, (
+        "app.py never calls auto_anchor_transcript — a fresh run would leave the "
+        "minutes showing the model's raw elapsed offsets."
+    )
+
+
+def test_the_render_path_anchoring_receives_the_measured_duration():
+    """Same silent-default trap as apply_datetime_overrides: a literal None keeps
+    the call present while disabling the scale decision."""
+    for call in _calls_to(_app_tree(), "auto_anchor_transcript"):
+        kw = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+        assert "duration_seconds" in kw, (
+            f"app.py:{call.lineno} calls auto_anchor_transcript without "
+            f"duration_seconds — the HH:MM scale could never be selected."
+        )
+        value = kw["duration_seconds"]
+        assert not (isinstance(value, ast.Constant) and value.value is None), (
+            f"app.py:{call.lineno} passes a literal None as duration_seconds."
+        )

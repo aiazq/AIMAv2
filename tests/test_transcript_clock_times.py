@@ -160,3 +160,34 @@ def test_model_validate_from_a_model_dump_is_unharmed():
     out = app.apply_datetime_overrides(_report(), None, datetime.time(10, 0))
     again = app.MeetingMinutesReport.model_validate(out.model_dump())
     assert [e.timestamp for e in again.transcript] == ["10:00:00", "10:00:21", "10:00:46"]
+
+
+# ---------------------------------------------------------------------------
+# A fresh run must already show clock times
+# ---------------------------------------------------------------------------
+def test_a_fresh_run_shows_clock_times_without_touching_the_panel():
+    """The panel is a correction tool, not a prerequisite. Requiring a save
+    before the minutes are readable would leave the reported bug visible on
+    every new run."""
+    out = app.auto_anchor_transcript(_report(), duration_seconds=60)
+    assert [e.timestamp for e in out.transcript] == ["10:00:00", "10:00:21", "10:00:46"]
+
+
+def test_auto_anchor_leaves_a_report_without_a_time_alone():
+    out = app.auto_anchor_transcript(_report(meeting_time=""), duration_seconds=60)
+    assert [e.timestamp for e in out.transcript] == ["00:00", "00:21", "00:46"]
+
+
+def test_auto_anchor_is_idempotent_across_reruns():
+    """Streamlit re-runs the script constantly; anchoring on every rerun must not
+    walk the times forward."""
+    once = app.auto_anchor_transcript(_report(), duration_seconds=60)
+    twice = app.auto_anchor_transcript(once, duration_seconds=60)
+    thrice = app.auto_anchor_transcript(twice, duration_seconds=60)
+    assert [e.timestamp for e in thrice.transcript] == ["10:00:00", "10:00:21", "10:00:46"]
+
+
+def test_auto_anchor_does_not_mutate_the_input_report():
+    original = _report()
+    app.auto_anchor_transcript(original, duration_seconds=60)
+    assert [e.timestamp for e in original.transcript] == ["00:00", "00:21", "00:46"]

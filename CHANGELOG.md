@@ -4,6 +4,19 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.4.1 — Transcript clock times appear on a fresh run
+
+### Fixed
+- **The minutes no longer need a panel save to show clock times.** v0.4 anchored
+  the transcript inside `apply_datetime_overrides`, which only runs when the user
+  opens the Date & Start Time panel and saves. A fresh run therefore still
+  displayed the model's raw elapsed offsets until that happened — the reported
+  bug, one click away. The render path now anchors on its own via
+  `auto_anchor_transcript`, using the report's own start time. The panel is a
+  correction tool, not a prerequisite for readable minutes.
+- Anchoring on every rerun stays idempotent, so Streamlit's constant
+  re-execution cannot walk the times forward.
+
 ## v0.4 — Transcript entries now show real clock times
 
 ### Fixed

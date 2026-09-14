@@ -168,6 +168,31 @@ do_case "F12 a second offset->clock implementation appears" "$TL" \
 "def format_clock_time_dup(start: datetime.time, offset_seconds: int) -> str:" \
 "tests/test_timeline_wiring.py tests/test_transcript_timeline.py"
 
+# --- F13: a fresh run never anchors (the panel becomes a prerequisite) ----
+do_case "F13 fresh run never anchors the transcript" "$APP" \
+"            result = auto_anchor_transcript(
+                result, duration_seconds=st.session_state.get(\"audio_duration_seconds\")
+            )" \
+"            pass" \
+"tests/test_transcript_clock_times.py tests/test_timeline_wiring.py"
+
+# --- F14: auto_anchor mutates the caller's report -------------------------
+do_case "F14 auto_anchor mutates its input report" "$APP" \
+"    updated = report.model_copy(deep=True)
+    _anchor_transcript(updated, start, duration_seconds)
+    return updated" \
+"    _anchor_transcript(report, start, duration_seconds)
+    return report" \
+"tests/test_transcript_clock_times.py"
+
+# --- F15: auto_anchor invents a start time when there is none -------------
+do_case "F15 auto_anchor invents a start time when there is none" "$APP" \
+"    start = parse_report_time(getattr(report, \"meeting_time\", None))
+    if start is None:
+        return report" \
+"    start = parse_report_time(getattr(report, \"meeting_time\", None)) or datetime.time(0, 0)" \
+"tests/test_transcript_clock_times.py"
+
 echo
 echo "==================== FALSIFICATION TABLE ===================="
 for row in "${TABLE[@]}"; do echo "  $row"; done

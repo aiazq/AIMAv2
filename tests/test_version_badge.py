@@ -62,7 +62,7 @@ def test_app_exposes_a_version_constant():
 def test_version_is_the_current_release():
     """Pins the release. Bumping APP_VERSION without updating this is a deliberate
     two-file edit, so a version bump can never be accidental."""
-    assert app.APP_VERSION == "v0.4"
+    assert app.APP_VERSION == "v0.4.1"
 
 
 def test_version_is_not_duplicated_as_a_literal():

@@ -177,7 +177,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.4"
+APP_VERSION = "v0.4.1"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1911,6 +1911,28 @@ def apply_datetime_overrides(
     return updated
 
 
+def auto_anchor_transcript(
+    report: MeetingMinutesReport,
+    duration_seconds: float | None = None,
+) -> MeetingMinutesReport:
+    """Anchor the transcript on the report's OWN start time, for a fresh run.
+
+    `apply_datetime_overrides` handles the user editing the panel, but a new run
+    never passes through it — so without this the minutes still read
+    `00:00`-relative until the user opens the panel and saves. The panel is a
+    correction tool, not a prerequisite for readable minutes.
+
+    Returns the report unchanged when its start time is unreadable: the raw
+    offsets are more honest than a fabricated clock time.
+    """
+    start = parse_report_time(getattr(report, "meeting_time", None))
+    if start is None:
+        return report
+    updated = report.model_copy(deep=True)
+    _anchor_transcript(updated, start, duration_seconds)
+    return updated
+
+
 def _anchor_transcript(
     report: MeetingMinutesReport,
     start: datetime.time,
@@ -2510,6 +2532,13 @@ def main():
             result = ensure_report_date(result)
             if parse_report_date(_raw_date) is None and (_raw_date or "").strip():
                 st.session_state["date_defaulted_from"] = _raw_date
+            # A fresh run never passes through the panel, so anchor the transcript
+            # here too — otherwise the minutes read 00:00-relative until the user
+            # happens to open the panel and save. Idempotent: an entry already
+            # anchored is recomputed from its remembered original offset.
+            result = auto_anchor_transcript(
+                result, duration_seconds=st.session_state.get("audio_duration_seconds")
+            )
             st.session_state["meeting_result"] = result
             active_template = st.session_state.get("saved_template_bytes")
 
