@@ -4,6 +4,28 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.2.1 — Editable meeting date & start time
+
+### Added
+- **Meeting Date & Start Time panel**, above the Speaker Identity Mapping &
+  Verification panel. The model infers a date and time from the conversation,
+  and it cannot always be right — a meeting held on the 14th but discussed as
+  "last Tuesday" misleads it, and a recording with no spoken date yields
+  "Undated". Both can now be corrected, and the change reaches the on-screen
+  header, the standard DOCX, and a custom template's `{{ date }}` /
+  `{{ meeting_time }}`.
+
+### Fixed
+- **An unreadable date no longer crashes the results page.** `date` is free text
+  from the model and may be `Undated` (the schema default), `12 September 2026`,
+  or `2026-09-12 (Saturday)`; `st.date_input` accepts none of those, and a naive
+  `date.fromisoformat(...)` raises on the very common `Undated`. Dates and times
+  are now parsed defensively across the formats the model actually emits, and a
+  value that cannot be read falls back to today **with an explicit warning**
+  rather than silently guessing.
+- `meeting_time` is stored as a range (`10:00 - 11:30`); the start is now taken
+  as the start time instead of the whole range failing to parse.
+
 ## v0.2 — Multi-file meetings
 
 The release that makes AIMA usable on meetings recorded in parts.
