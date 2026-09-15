@@ -4,6 +4,21 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.5.1 — Upload limit raised to 400 MB
+
+### Changed
+- **`st.file_uploader` now accepts files up to 400 MB** (was Streamlit's 200 MB
+  built-in default) via `.streamlit/config.toml` in the app root — the per-project
+  config file that governs a deployed app.
+- Worth noting: 200 MB was never a value in our code. It is Streamlit's default,
+  so raising it means adding a config file, not editing a constant. A
+  `config.toml` capped at 120 MB previously existed here but was deleted in the
+  live-microphone revert (`e35d7d8`), leaving the app on the bare default.
+- 400 is chosen against the ~1 GB container, not the API: audio is sent
+  unaltered (v0.5), so one upload costs roughly 2.4x its size at peak — raw
+  bytes resident while the ~1.37x base64 body is built. Batches remain gated in
+  code by `media_pipeline.MAX_TOTAL_MB`.
+
 ## v0.5 — Audio is sent to the model unaltered
 
 ### Changed

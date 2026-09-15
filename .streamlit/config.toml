@@ -1,0 +1,15 @@
+# Streamlit's built-in cap on st.file_uploader is 200 MB. We raise it here.
+#
+# Per Streamlit's Community Cloud guidance, the per-project config file is what
+# applies to a deployed app — this file is read from the app root, so it must be
+# committed to the repo (unlike .streamlit/secrets.toml, which never is).
+#
+# Why 400 and not unlimited: uploaded audio is sent to the model UNALTERED
+# (v0.5 removed the ffmpeg transcode stage), so raw bytes are base64-encoded
+# into a single JSON request body at ~1.37x, and the source bytes are still
+# resident while that body is built. Peak RSS for one upload is therefore
+# roughly 2.4x the file size. A ~1 GB Community Cloud instance puts the
+# practical ceiling near 400 MB for a single file, which is what this cap
+# encodes. Batches are still gated in code by media_pipeline.MAX_TOTAL_MB.
+[server]
+maxUploadSize = 400

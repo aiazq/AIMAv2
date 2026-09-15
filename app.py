@@ -177,7 +177,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.5"
+APP_VERSION = "v0.5.1"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
