@@ -4,6 +4,37 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.5.2 — Transcript offsets past the hour are no longer misread
+
+### Fixed
+- **Timestamps no longer collapse to the first minute (or jump hours ahead) in
+  meetings longer than an hour.** The offset-scale decision treated a 2-field
+  offset whose leading field exceeded 59 as proof of `HH:MM`, on the reasoning
+  that `MM:SS` "caps at 59 minutes". That reasoning is wrong: in a recording
+  longer than an hour the MINUTE count is what grows past 59. So `75:10` — a
+  normal 75 min 10 s offset — was read as **75 hours 10 minutes**, and a
+  90-minute meeting's final entry landed at `04:00:00` instead of `11:30:00`.
+  The scale is now decided purely by which reading is consistent with the
+  recording's measured length.
+- **A rounded final timestamp no longer discards the whole reading.** The model
+  rounds to the minute while ffprobe measures the container exactly, so the last
+  entry of a 60-minute meeting can read `01:00` against a measured 3599.4 s. The
+  old check rejected `HH:MM` for overrunning by 0.6 s and fell back to `MM:SS`,
+  placing all four entries inside the first minute (`10:01`). A small slack now
+  absorbs rounding without admitting a genuinely over-long reading, which would
+  be wrong by a factor of 60.
+- When both readings are consistent with the duration, the one that spans more
+  of the recording now wins — previously a `MM:SS` reading could win by being
+  merely small, describing a transcript of the recording's opening seconds.
+
+### Notes
+- The `>59 ⇒ HH:MM` rule is retained nowhere; `_MMSS_MAX_MINUTES` and
+  `_COVERAGE_THRESHOLD` are gone, replaced by a single duration-consistency
+  check (`_ROUNDING_SLACK_SECONDS`).
+- Two tests asserted the old, incorrect rule (`75:10` → `HH:MM`,
+  `60:10` → `HH:MM`); they are replaced by tests pinning the corrected
+  behaviour, including the rounded-final-stamp case that caused the regression.
+
 ## v0.5.1 — Upload limit raised to 400 MB
 
 ### Changed

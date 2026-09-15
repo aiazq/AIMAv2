@@ -88,17 +88,55 @@ def test_a_long_meeting_reads_two_fields_as_hours_and_minutes():
     assert timeline.resolve_scale(stamps, duration_seconds=9000) == timeline.HHMM
 
 
-def test_a_leading_field_over_59_forces_hours_and_minutes():
-    """`75:10` cannot be MM:SS at all; no duration needed."""
-    assert timeline.resolve_scale(["00:10", "75:10"]) == timeline.HHMM
+def test_a_leading_field_over_59_still_reads_as_minutes_and_seconds():
+    """`75:10` is a normal MM:SS offset in a 75-minute recording.
+
+    An earlier version treated a leading field above 59 as proof of HH:MM, on
+    the reasoning that MM:SS "caps at 59 minutes". It does not: the MINUTE count
+    is what grows past 59 in a long recording, so `75:10` is 75 min 10 s. The
+    old rule read it as 75 HOURS, which is the class of bug this pins.
+    """
+    assert timeline.resolve_scale(["00:10", "75:10"]) == timeline.MMSS
 
 
-def test_the_leading_field_boundary_is_59_not_60():
-    """MM:SS can never reach a 60-minute leading field — `60:10` is exactly the
-    case that distinguishes the real bound from an off-by-one."""
-    assert timeline.resolve_scale(["00:10", "60:10"]) == timeline.HHMM
-    # 59 is still a legal MM:SS reading, so it must NOT force the HH:MM scale.
-    assert timeline.resolve_scale(["00:10", "59:10"]) == timeline.MMSS
+def test_a_minutes_seconds_offset_past_the_hour_uses_the_duration():
+    """A 90-minute meeting written `90:00`, with the real duration measured.
+
+    MM:SS accounts for 90 min of a 90-min recording; HH:MM would claim 90 hours.
+    Only the duration-anchored reading is consistent.
+    """
+    stamps = ["00:00", "20:00", "45:00", "70:00", "90:00"]
+    assert timeline.resolve_scale(stamps, duration_seconds=5400) == timeline.MMSS
+
+
+def test_an_hh_mm_offset_that_overruns_the_recording_is_rejected():
+    """`01:30` in a 60-min recording is not 1.5 hours of a 1-hour meeting."""
+    stamps = ["00:00", "00:20", "00:45", "01:30"]
+    assert timeline.resolve_scale(stamps, duration_seconds=3600) == timeline.MMSS
+
+
+def test_rounding_slack_keeps_the_hh_mm_reading_for_a_rounded_final_stamp():
+    """The model rounds to the minute; ffprobe measures the container exactly.
+
+    A 60-minute meeting's last entry reads `01:00` while ffprobe reports
+    3599.4 s. Without slack the HH:MM reading "overran" by 0.6 s, was rejected,
+    and the whole transcript collapsed into its first minute - the reported bug.
+    """
+    stamps = ["00:00", "00:12", "00:35", "01:00"]
+    assert timeline.resolve_scale(stamps, duration_seconds=3599.4) == timeline.HHMM
+    assert timeline.anchor(
+        stamps, datetime.time(10, 0), duration_seconds=3599.4
+    )[-1] == "11:00:00"
+
+
+def test_a_small_reading_never_wins_over_a_fitting_larger_one():
+    """Both readings consistent: the one spanning more of the recording wins.
+
+    A 2 h meeting written `01:55` is 1 h 55 min, not 1 min 55 s - the latter is
+    consistent but describes a transcript of the recording's opening seconds.
+    """
+    stamps = ["00:05", "01:10", "01:55"]
+    assert timeline.resolve_scale(stamps, duration_seconds=7200) == timeline.HHMM
 
 
 def test_without_a_duration_the_documented_fallback_is_minutes_and_seconds():
