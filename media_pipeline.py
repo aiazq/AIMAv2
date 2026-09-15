@@ -1,17 +1,18 @@
 """Multi-file audio ingestion helpers (Enhancement 1).
 
-Pure logic, deliberately free of Streamlit so it is unit-testable: ordering,
-batch-size validation, and the ffmpeg transcode that keeps a multi-part run
-inside the container's memory budget.
+Pure logic, deliberately free of Streamlit so it is unit-testable: ordering and
+batch-size validation.
 
-Why compression is not optional here: the Gemini path base64-inlines each part
-into the JSON body, so peak RAM is ~3.7x raw bytes. Three 90 MB parts is
-270 MB resident -> ~988 MB peak, against Community Cloud's 1 GB ceiling. Mono
-32 kbps speech drops that to ~70 MB total with no accuracy loss in practice,
-because Gemini downsamples to 16 kbps and collapses to mono anyway.
+Audio is sent RAW to the model — this module no longer transcodes it. The v0.2
+ffmpeg stage was removed in v0.5 because it degraded recognition for no benefit:
+it collapsed stereo to mono and capped the signal at 16 kHz, discarding the
+>8 kHz band where sibilants live. `compress_audio` is retained below as an
+unused utility (and contract of record for the removed behaviour); the send path
+does not call it.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -19,17 +20,72 @@ from dataclasses import dataclass
 
 MB = 1024 * 1024
 
-# Documented Gemini inline ceiling: 20 MB total request including the prompt.
-# We leave headroom for the prompt text and the response schema.
-INLINE_MAX_REQUEST_MB = 20.0
+# Browser-reported MIME -> type the API accepts.
+#
+# Load-bearing now that audio is sent raw: the browser's string goes straight
+# into the request. Safari reports `audio/x-m4a` for a .m4a (not an accepted
+# type), and `audio/x-wav` / `audio/x-mpeg` variants are common across OSes.
+# Before v0.5 the transcoder normalised everything to audio/mp3, which masked
+# this entirely.
+_MIME_ALIASES = {
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+    "audio/mp4a-latm": "audio/mp4",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/x-mpeg": "audio/mp3",
+    "audio/mpeg": "audio/mp3",
+    "audio/mpeg3": "audio/mp3",
+    "audio/x-mp3": "audio/mp3",
+    "audio/x-aac": "audio/aac",
+    "audio/x-ogg": "audio/ogg",
+    "audio/vorbis": "audio/ogg",
+    "audio/x-flac": "audio/flac",
+    "video/x-m4v": "video/mp4",
+    "video/quicktime": "video/mp4",
+}
+
+_EXT_MIME = {
+    ".mp3": "audio/mp3",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".mp4": "video/mp4",
+}
+
+
+def normalize_mime(mime: str, filename: str = "") -> str:
+    """Map a browser-reported MIME to one the API accepts.
+
+    Falls back to the file extension, then to audio/mp3, so an empty or
+    unknown `FileUpload.type` still produces a usable request rather than an
+    unsupported-media rejection.
+    """
+    m = (mime or "").split(";")[0].strip().lower()
+    if m in _MIME_ALIASES:
+        return _MIME_ALIASES[m]
+    if m.startswith("audio/") or m.startswith("video/"):
+        return m
+    ext = os.path.splitext(filename or "")[1].lower()
+    return _EXT_MIME.get(ext, "audio/mp3")
+
+# Assumed Gemini inline ceiling for a single request. Audio is sent raw now, so
+# this — not the compressor — is the binding limit on batch size.
+INLINE_MAX_REQUEST_MB = 2048.0
 PROMPT_HEADROOM_MB = 5.0
-INLINE_RAW_BUDGET_MB = INLINE_MAX_REQUEST_MB - PROMPT_HEADROOM_MB  # 15.0
+INLINE_RAW_BUDGET_MB = INLINE_MAX_REQUEST_MB - PROMPT_HEADROOM_MB  # 2043.0
 
-# Whole-batch ceiling. Below the 1 GB container wall with room to spare.
-MAX_TOTAL_MB = 260.0
+# Whole-batch ceiling, tracking the assumed API limit above.
+#
+# NOTE: the API is no longer the tightest constraint — the container is. Raw
+# bytes are base64'd into the JSON body (~1.37x), and Streamlit Community Cloud
+# gives ~1 GB of RAM. A batch well below 2 GB can therefore still OOM the
+# process. Raise/keep this in step with the hosting plan, not just the API.
+MAX_TOTAL_MB = 2048.0
 
-# Gemini downsamples to 16 kbps mono regardless, so a higher bitrate buys
-# nothing but bytes. Keep this in step with the duration derived below.
+# Retained only for the unused `compress_audio` utility below.
 COMPRESS_TARGET_KBPS = 32
 
 
@@ -108,6 +164,12 @@ def ffmpeg_available() -> bool:
 
 def compress_audio(raw: bytes, suffix: str, kbps: int = COMPRESS_TARGET_KBPS) -> bytes:
     """Transcode `raw` to mono MP3 at `kbps`, through pipes.
+
+    NOT on the send path as of v0.5 — the app sends raw uploads. Kept because it
+    is a working, tested utility and the contract of record for the removed
+    behaviour (mono / 16 kHz / 32 kbps). Do not re-wire it into
+    `analyze_meeting_audio_rest` without re-reading the why-removed note at the
+    top of this module.
 
     Piped so the source bytes are never copied again in Python. On any failure
     the original bytes are returned — a graceful degrade to "sends but may be

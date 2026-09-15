@@ -40,8 +40,6 @@ def _run(monkeypatch, transcript, logs):
         return resp
 
     monkeypatch.setattr(app, "dispatch_http_request", _dispatch)
-    monkeypatch.setattr(app.media_pipeline, "compress_audio",
-                        lambda raw, suffix, kbps=32: raw)
     monkeypatch.setattr(app.time, "sleep", lambda *_: None)
 
     report, _ = app.analyze_meeting_audio_rest(

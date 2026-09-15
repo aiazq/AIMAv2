@@ -4,6 +4,42 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.5 — Audio is sent to the model unaltered
+
+### Changed
+- **The transcode stage is gone: uploaded audio now reaches the model
+  byte-for-byte, exactly as the hackathon build sent it.** v0.2 forced every
+  part through ffmpeg to mono / 16 kHz / 32 kbps before upload. That silently
+  traded recognition quality for bytes — it collapsed the stereo image and cut
+  the signal at 8 kHz, discarding the band where sibilants and consonant detail
+  live, and the provider was going to downsample regardless. Nothing is
+  resampled, downmixed or re-encoded now.
+- **Batch ceiling retuned for raw audio.** Sending raw bytes means size is no
+  longer absorbed by compression, so the whole-batch limit moves from 260 MB to
+  2 GB to track the assumed API ceiling.
+  ⚠️ The container is now the tighter constraint, not the API: raw bytes are
+  base64'd into the request body (~1.37x), and this app runs on a ~1 GB
+  Community Cloud instance. A batch well under 2 GB can still exhaust memory.
+
+### Fixed
+- **Safari `.m4a` uploads no longer arrive with an unsupported type label.**
+  Safari reports `audio/x-m4a`, which the API does not accept. This was
+  previously invisible because the transcoder relabelled every part as
+  `audio/mp3`. With raw passthrough the declared type travels as-is, so MIME is
+  now normalised (`audio/x-m4a` → `audio/mp4`, plus wav/mpeg/ogg variants),
+  falling back to the file extension.
+- **OpenAI-compatible endpoints no longer receive unknown decode hints.** The
+  `input_audio.format` field was derived from the MIME subtype and could emit
+  `mp4`/`x-m4a`. It is now mapped onto the accepted `mp3`/`wav` hints.
+
+### Notes
+- `media_pipeline.compress_audio` is retained as an unused, tested utility and
+  as the contract of record for the removed behaviour. It is no longer called
+  from the send path.
+- The bit-exactness of the passthrough is pinned by test
+  (`test_audio_bytes_reach_the_model_bit_for_bit`), so a future refactor cannot
+  quietly reintroduce encoding here.
+
 ## v0.4.1 — Transcript clock times appear on a fresh run
 
 ### Fixed

@@ -177,7 +177,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.4.1"
+APP_VERSION = "v0.5"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1546,7 +1546,13 @@ def analyze_meeting_audio_rest(
 
     # Every part travels in ONE request, in user order, so the model sees a single
     # continuous meeting rather than N unrelated recordings.
-    all_parts = [(audio_file_bytes, mime_type)] + list(extra_parts)
+    # MIME is normalised per part: raw bytes carry the browser's declared type,
+    # and Safari's "audio/x-m4a" is not an accepted request type.
+    all_parts = [
+        (audio_file_bytes, media_pipeline.normalize_mime(mime_type)),
+    ] + [
+        (b, media_pipeline.normalize_mime(m)) for b, m in extra_parts
+    ]
 
     raw_total_mb = sum(len(b) for b, _ in all_parts) / (1024 * 1024)
     log_event(
@@ -1562,35 +1568,29 @@ def analyze_meeting_audio_rest(
     if not ok:
         raise RuntimeError(budget_msg)
 
-    # Transcode each part down to mono speech bitrate. This is what keeps the run
-    # inside the container's memory budget: base64 + JSON serialization costs
-    # ~3.7x raw bytes, and 270 MB raw would peak near 1 GB.
+    # Audio travels RAW: the uploaded bytes go to the model byte-for-byte, with
+    # the container and mime type the browser read off disk. Nothing is
+    # transcoded, resampled or downmixed.
+    #
+    # v0.2 used to force every part to mono / 16 kHz / 32 kbps here. That stage
+    # was removed in v0.5: it traded real signal (stereo image, the >8 kHz band
+    # where sibilants live) for bytes the provider was going to discard anyway,
+    # and it silently no-opped on some containers. Recognition quality is the
+    # product, so the audio is no longer touched.
     encoded: list[tuple[bytes, str]] = []
     for idx, (raw_bytes, mime) in enumerate(all_parts, start=1):
-        suffix = "." + (mime.split("/")[-1].replace("mpeg", "mp3") or "mp3")
         status_text.markdown(
-            f"🔄 *Compressing part {idx}/{len(all_parts)} for efficient upload...*"
+            f"🔄 *Preparing part {idx}/{len(all_parts)} for upload...*"
         )
         progress_bar.progress(int(5 + 20 * (idx - 1) / max(len(all_parts), 1)))
-        compressed = media_pipeline.compress_audio(raw_bytes, suffix)
-        if len(compressed) < len(raw_bytes):
-            log_event(
-                log_container,
-                logs_list,
-                f"Part {idx}: {len(raw_bytes) / (1024 * 1024):.2f} MB → "
-                f"{len(compressed) / (1024 * 1024):.2f} MB "
-                f"({media_pipeline.COMPRESS_TARGET_KBPS} kbps mono)",
-                "DEBUG",
-            )
-        else:
-            log_event(
-                log_container,
-                logs_list,
-                f"Part {idx}: sent unchanged ({len(raw_bytes) / (1024 * 1024):.2f} MB)",
-                "DEBUG",
-            )
-        encoded.append((compressed, "audio/mp3" if compressed is not raw_bytes else mime))
-        # Release the raw slice as soon as it has been transcoded.
+        log_event(
+            log_container,
+            logs_list,
+            f"Part {idx}: sending raw ({len(raw_bytes) / (1024 * 1024):.2f} MB, {mime})",
+            "DEBUG",
+        )
+        encoded.append((raw_bytes, mime))
+        # Release the raw slice — it has been copied into `encoded`.
         all_parts[idx - 1] = (b"", mime)
 
     status_text.markdown("🔄 *Encoding audio stream to base64...*")
@@ -1675,9 +1675,20 @@ def analyze_meeting_audio_rest(
             "Authorization": f"Bearer {api_key}",
         }
         # One input_audio item per file, same order.
+        #
+        # `format` is what the decode hint tells the provider to expect. Only
+        # wav/mp3 are unambiguous across OpenAI-compatible gateways, so map the
+        # container onto the closest accepted hint instead of forwarding raw
+        # suffixes like "mp4" or "x-m4a".
+        _FMT_HINT = {
+            "mp3": "mp3", "mpeg": "mp3", "mp4": "mp3", "m4a": "mp3",
+            "x-m4a": "mp3", "aac": "mp3", "ogg": "mp3", "webm": "mp3",
+            "wav": "wav", "x-wav": "wav", "wave": "wav", "vnd.wave": "wav",
+        }
         media_items = []
         for d, m in b64_parts:
-            audio_fmt = m.split("/")[-1].replace("mpeg", "mp3")
+            audio_fmt = m.split("/")[-1].replace("mpeg", "mp3").lower()
+            audio_fmt = _FMT_HINT.get(audio_fmt, "mp3")
             media_items.append(
                 {"type": "input_audio", "input_audio": {"data": d, "format": audio_fmt}}
             )
@@ -2282,7 +2293,10 @@ def main():
             parts = media_pipeline.order_parts(parts, order_map)
 
             bytes_by_key = registry
-            mime_by_key = {f.file_id: (f.type or "audio/mp3") for f in audio_files}
+            mime_by_key = {
+                f.file_id: media_pipeline.normalize_mime(f.type, f.name)
+                for f in audio_files
+            }
 
             n = len(parts)
             total = media_pipeline.total_bytes(parts)
