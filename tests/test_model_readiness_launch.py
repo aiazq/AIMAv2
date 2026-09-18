@@ -82,11 +82,27 @@ class _StubProvider(BaseHTTPRequestHandler):
         type(self).posts_seen += 1
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
+        if self.completion_status != 200:
+            body = json.dumps({
+                "error": {
+                    "code": self.completion_status,
+                    "message": "This model is currently experiencing high demand. "
+                               "Spikes in demand are usually temporary. Please try "
+                               "again later.",
+                    "status": "UNAVAILABLE",
+                }
+            }).encode()
+            self.send_response(self.completion_status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         body = json.dumps(
             {"choices": [{"message": {"role": "assistant", "content": "ok"}}],
              "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
         ).encode()
-        self.send_response(self.completion_status)
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -97,6 +113,7 @@ class _StubProvider(BaseHTTPRequestHandler):
 def stub_provider():
     """A real HTTP server on localhost, one per test, torn down afterwards."""
     _StubProvider.posts_seen = 0
+    _StubProvider.completion_status = 200
     server = HTTPServer(("127.0.0.1", 0), _StubProvider)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -138,9 +155,8 @@ def test_the_app_still_boots_with_the_check_enabled(stub_provider):
 def test_a_ready_model_is_reported_in_the_execution_console(stub_provider):
     """Positive case: the user is told the model is fine, at launch.
 
-    `posts_seen == 0` is the real assertion here: it pins the token-cost claim.
-    A listing the provider already publishes must be answered from the catalogue,
-    never by a completion.
+    A catalogue hit is confirmed by one capped probe, so exactly one POST is
+    expected — and it must be a 1-token request, not a real generation.
     """
     _StubProvider.catalogue = ["gemini-3.6-flash"]
     _StubProvider.catalogue_status = 200
@@ -149,8 +165,31 @@ def test_a_ready_model_is_reported_in_the_execution_console(stub_provider):
     assert "aima-terminal-box" in text
     assert "Model readiness" in text, f"no readiness line on screen: {text[-800:]}"
     assert "gemini-3.6-flash" in text
-    assert _StubProvider.posts_seen == 0, (
-        "a model the catalogue already lists must cost zero tokens to verify"
+    assert _StubProvider.posts_seen == 1, (
+        "a listed model must be confirmed by exactly one capped probe"
+    )
+
+
+def test_a_listed_but_overloaded_model_is_reported_at_launch(stub_provider):
+    """The reported failure, reproduced end-to-end.
+
+    The catalogue lists the model, so the old check announced READY — and the
+    user's first real request came back 503 UNAVAILABLE. Now the launch message
+    must say the provider is busy, and must NOT blame the configuration.
+    """
+    _StubProvider.catalogue = ["gemini-3.6-flash"]
+    _StubProvider.catalogue_status = 200
+    _StubProvider.completion_status = 503
+    rendered = _boot(stub_provider)
+    text = _console_text(rendered)
+    assert "Model readiness" in text, f"no readiness line on screen: {text[-800:]}"
+    assert "overload" in text.lower() or "high demand" in text.lower(), (
+        f"the launch message must report the provider as busy: {text[-600:]}"
+    )
+    assert "gemini-3.6-flash" in text, "the message must name the model affected"
+    assert "Settings" not in text, (
+        "an overloaded provider is not a misconfiguration — do not send the user "
+        "to Settings for it"
     )
 
 

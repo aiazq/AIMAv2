@@ -184,3 +184,64 @@ def test_the_settings_menu_names_all_three_things_the_user_can_change():
     assert "model" in guidance
     assert "key" in guidance
     assert "endpoint" in guidance
+
+
+def test_the_processing_dispatch_retries_a_transient_failure():
+    """A 503 on the processing path must not discard a completed upload.
+
+    This was a real production failure. The upload has already happened by the
+    time the dispatch runs, so the retry is not a nicety — without it the user
+    re-uploads hundreds of megabytes to fix something that was never wrong on
+    their side.
+    """
+    src = _app_source()
+    assert "RETRYABLE_STATUS" in src, "no retryable-status set on the dispatch path"
+    assert re.search(r"DISPATCH_MAX_ATTEMPTS\s*=\s*[2-9]", src), (
+        "the dispatch must attempt more than once"
+    )
+    assert re.search(r"for attempt in range\(1, DISPATCH_MAX_ATTEMPTS", src), (
+        "the dispatch has no retry loop"
+    )
+    # A permanent rejection must still fail fast rather than burn the retries.
+    assert re.search(r"not in RETRYABLE_STATUS", src), (
+        "a permanent failure must be raised without retrying"
+    )
+
+
+def test_the_overload_message_does_not_misdirect_the_user():
+    """A busy provider is not a misconfiguration. The guidance for it must say so
+    rather than sending the user to Settings, which cannot fix it.
+
+    Asserted against `model_check` (a pure-logic module, importable with no
+    Streamlit runtime) rather than `app` — the wiring module stays static-only so
+    these guards remain cheap and runtime-free.
+    """
+    import model_check
+
+    busy = model_check.ModelCheckResult(
+        False, model_check.OVERLOADED,
+        message="The provider is overloaded and declined to run 'm' (HTTP 503).",
+    )
+    line = busy.console_line()
+    assert "overload" in line.lower() or "temporary" in line.lower()
+    assert "Settings" not in line, (
+        "an overloaded provider is not a misconfiguration — do not send the user "
+        "to Settings for it"
+    )
+    assert busy.severity == "warning"
+
+
+def test_the_dispatch_describes_busy_separately_from_broken():
+    """The dispatch-path message must distinguish "wait" from "fix your config".
+
+    Checked as source text (this module does not import `app`), asserting the
+    two branches exist and that the busy one says the condition is temporary.
+    """
+    src = _app_source()
+    body = re.search(r"def _describe_http_failure.*?(?=\ndef )", src, re.S)
+    assert body, "no failure-description helper on the dispatch path"
+    text = body.group(0)
+    assert "_BUSY_STATUS_CODES" in text, "busy statuses are not distinguished"
+    assert "temporary" in text.lower(), (
+        "the busy message must tell the user the condition is temporary"
+    )

@@ -26,7 +26,14 @@ from __future__ import annotations
 READY = "ready"
 MISSING = "missing"
 AUTH = "auth"
+OVERLOADED = "overloaded"
 UNKNOWN = "unknown"
+
+# Provider states that mean "busy right now", not "misconfigured". A 503 from a
+# Gemini-style frontend reads `UNAVAILABLE` with "high demand ... usually
+# temporary"; a 429 is the same story with a quota hint. Neither is fixed by
+# anything in Settings, so neither may be presented as a configuration error.
+_BUSY_STATUSES = (429, 503)
 
 _CATALOGUE_TIMEOUT = 10.0
 _PROBE_TIMEOUT = 20.0
@@ -71,10 +78,12 @@ class ModelCheckResult:
     def severity(self) -> str | None:
         """Console severity: `"error"`, `"warning"`, or None when ready.
 
-        `MISSING` / `AUTH` are definite answers and read as errors. `UNKNOWN` is
-        the ABSENCE of an answer — a gateway that hides its catalogue, a slow
-        proxy — so it reads as a warning. Presenting uncertainty as an error
-        would send the user chasing a problem that may not exist.
+        `MISSING` / `AUTH` are definite answers and read as errors. `UNKNOWN` and
+        `OVERLOADED` are NOT answers about the configuration — a gateway that
+        hides its catalogue, a slow proxy, a model the provider is momentarily
+        refusing — so they read as warnings. Presenting either as an error would
+        send the user chasing a problem that does not exist and that nothing in
+        Settings can fix.
         """
         if self.ok:
             return None
@@ -192,6 +201,19 @@ def probe_model(base_url, api_key, model_name, client_factory=None,
             tokens_used=_PROBE_MAX_TOKENS,
         )
 
+    if resp.status_code in _BUSY_STATUSES:
+        # The provider is refusing everyone right now. That is not a
+        # configuration fault and nothing in Settings changes it, so it must not
+        # be reported as one.
+        return ModelCheckResult(
+            ok=False, status=OVERLOADED,
+            message=(
+                f"The provider is overloaded and declined to run '{model_name}' "
+                f"(HTTP {resp.status_code}). This is usually temporary — retrying "
+                "shortly normally works."
+            ),
+        )
+
     if resp.status_code in (401, 403):
         return ModelCheckResult(
             ok=False, status=AUTH,
@@ -225,21 +247,22 @@ def validate_model(base_url, api_key, model_name, client_factory=None,
                    timeout=None) -> ModelCheckResult:
     """Decide whether `model_name` is usable at `base_url`.
 
-    Rung 1 (free): the provider's catalogue. A model listed as present is proof
-    of readiness and costs no tokens; a model absent from a catalogue that was
-    read successfully is proof of the opposite, and is conclusive — asking again
-    cannot reach a model the provider does not advertise.
+    Cost is one metadata call plus one capped completion, in every path:
 
-    Rung 2 (one token): only when the catalogue could not be read at all.
+    Rung 1 (free): the provider's catalogue answers whether the model EXISTS. A
+    model absent from a catalogue that was read successfully is conclusive and
+    stops here — asking again cannot reach a model the provider does not
+    advertise. This is the path that avoids spending anything.
+
+    Rung 2 (one token): the catalogue proves existence, not availability. A model
+    can be listed and still be refused with 503 while the provider is overloaded.
+    That gap was a real reported failure — the app announced the model READY and
+    the user's first request came back `UNAVAILABLE` — so a catalogue hit is
+    CONFIRMED with the same one-token probe used when the catalogue is silent.
+    The cost is identical either way, which is why this is affordable.
     """
     catalogue = list_models(base_url, api_key, client_factory=client_factory)
-    if catalogue is not None:
-        if model_name in catalogue:
-            return ModelCheckResult(
-                ok=True, status=READY,
-                message=f"Model '{model_name}' is listed as available.",
-                tokens_used=0,
-            )
+    if catalogue is not None and model_name not in catalogue:
         return ModelCheckResult(
             ok=False, status=MISSING,
             message=(
@@ -248,7 +271,8 @@ def validate_model(base_url, api_key, model_name, client_factory=None,
             ),
         )
 
-    # The catalogue could not answer — spend the one token that can.
+    # Either the catalogue could not answer, or it listed the model and we must
+    # still confirm the endpoint will actually serve it. Same one token.
     return probe_model(
         base_url, api_key, model_name, client_factory=client_factory, timeout=timeout
     )

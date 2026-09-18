@@ -179,7 +179,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.6"
+APP_VERSION = "v0.6.1"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -1612,9 +1612,37 @@ def build_default_docx(data: MeetingMinutesReport) -> io.BytesIO:
 # -----------------------------------------------------------------------------
 # Audio Pipeline Dispatcher
 # -----------------------------------------------------------------------------
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+# Statuses where the provider is busy rather than the request being wrong.
+_BUSY_STATUS_CODES = (429, 503)
+
+# How many times one dispatch is attempted before giving up. The upload has
+# already happened by the time this runs, so a retry is far cheaper than making
+# the user re-upload: a provider that is transiently busy is worth waiting out.
+DISPATCH_MAX_ATTEMPTS = 4
+
+
+def _describe_http_failure(status_code: int, body: str) -> str:
+    """Turn a provider status into something a user can act on.
+
+    A raw JSON blob tells the user nothing about whether THEY have to change
+    something. A 503/429 is the provider being busy — the fix is to wait, and
+    sending the user to Settings for it would be wrong advice.
+    """
+    if status_code in _BUSY_STATUS_CODES:
+        return (
+            f"The provider is overloaded right now (HTTP {status_code}). This is "
+            "usually temporary and not a problem with your configuration — "
+            "please try again in a moment."
+        )
+    return f"HTTP {status_code}: {body}"
+
+
 def dispatch_http_request(endpoint_url: str, headers: dict, payload: dict) -> httpx.Response:
     with httpx.Client(timeout=360.0) as client:
         return client.post(endpoint_url, headers=headers, json=payload)
+
 
 
 def analyze_meeting_audio_rest(
@@ -1798,9 +1826,6 @@ def analyze_meeting_audio_rest(
     log_event(log_container, logs_list, f"Dispatching POST request to: {endpoint_url}", "DEBUG")
     progress_bar.progress(35)
 
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(dispatch_http_request, endpoint_url, headers, payload)
-
     req_start = time.time()
     quip_pool = list(FUNNY_QUIPS)
     random.shuffle(quip_pool)
@@ -1808,39 +1833,70 @@ def analyze_meeting_audio_rest(
     last_quip_time = req_start
     pct = 35
 
-    while not future.done():
-        time.sleep(1.2)
-        elapsed = time.time() - req_start
-
-        if pct < 85:
-            pct += 1
-            progress_bar.progress(pct)
-
-        if time.time() - last_quip_time > 7.0:
-            current_quip = quip_pool[quip_idx % len(quip_pool)]
-            status_text.markdown(f"💬 *{current_quip}*")
-            log_event(log_container, logs_list, current_quip, "QUIP")
+    # Retry a transient provider failure instead of discarding the run. The audio
+    # is already uploaded at this point, so failing on the first 503 would make
+    # the user re-upload hundreds of megabytes to fix nothing on their side. The
+    # in-flight heartbeat below keeps the progress bar alive across attempts, so
+    # a slow retry looks like work rather than a hang.
+    response = None
+    for attempt in range(1, DISPATCH_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            delay = min(2 ** (attempt - 1), 16)
             log_event(
-                log_container,
-                logs_list,
-                f"Heartbeat: Model reasoning active... (elapsed: {int(elapsed)}s)",
-                "DEBUG",
+                log_container, logs_list,
+                f"Provider was busy (HTTP {response.status_code}); retrying in "
+                f"{delay}s (attempt {attempt} of {DISPATCH_MAX_ATTEMPTS}).",
+                "WARN",
             )
-            quip_idx += 1
-            last_quip_time = time.time()
+            time.sleep(delay)
 
-    response = future.result()
-    latency = time.time() - req_start
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(dispatch_http_request, endpoint_url, headers, payload)
 
-    log_event(
-        log_container,
-        logs_list,
-        f"Provider response received in {latency:.2f}s (HTTP {response.status_code})",
-        "SUCCESS" if response.status_code == 200 else "ERROR",
-    )
+        req_start = time.time()
+        last_quip_time = req_start
+
+        while not future.done():
+            time.sleep(1.2)
+            elapsed = time.time() - req_start
+
+            if pct < 85:
+                pct += 1
+                progress_bar.progress(pct)
+
+            if time.time() - last_quip_time > 7.0:
+                current_quip = quip_pool[quip_idx % len(quip_pool)]
+                status_text.markdown(f"💬 *{current_quip}*")
+                log_event(log_container, logs_list, current_quip, "QUIP")
+                log_event(
+                    log_container,
+                    logs_list,
+                    f"Heartbeat: Model reasoning active... (elapsed: {int(elapsed)}s)",
+                    "DEBUG",
+                )
+                quip_idx += 1
+                last_quip_time = time.time()
+
+        response = future.result()
+        latency = time.time() - req_start
+
+        log_event(
+            log_container,
+            logs_list,
+            f"Provider response received in {latency:.2f}s (HTTP {response.status_code})",
+            "SUCCESS" if response.status_code == 200 else "ERROR",
+        )
+
+        if response.status_code == 200:
+            break
+
+        if response.status_code not in RETRYABLE_STATUS:
+            # A definite rejection (bad request, bad key) will not fix itself.
+            # Retrying only delays the message and hides the cause.
+            raise RuntimeError(_describe_http_failure(response.status_code, response.text))
 
     if response.status_code != 200:
-        raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+        raise RuntimeError(_describe_http_failure(response.status_code, response.text))
 
     progress_bar.progress(90)
     status_text.markdown("⚡ *Validating JSON structure and parsing usage metadata...*")

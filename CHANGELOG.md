@@ -4,6 +4,35 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.6.1 — A busy provider no longer discards the run, and is reported at launch
+
+### Fixed
+- **A transient provider overload (HTTP 503 `UNAVAILABLE`, "high demand") no
+  longer throws away a completed upload.** The processing path dispatched once
+  and failed on the first non-200, so a condition the provider itself describes
+  as temporary cost the user the whole upload and dispatch. Retryable statuses
+  (429, 5xx, timeouts) are now retried with exponential backoff before giving up;
+  a definite rejection (400/401/403) still fails immediately, because retrying it
+  would only delay the message and hide the cause.
+- **A model that is listed but currently overloaded is no longer reported as
+  ready at launch.** The launch check previously stopped at the provider's model
+  catalogue, which proves a model *exists* — not that the endpoint will *serve*
+  it. A 503 was therefore invisible to it: the app announced the model ready and
+  the user's first real request came back `UNAVAILABLE`. A catalogue hit is now
+  confirmed with the same capped one-token probe already used when the catalogue
+  cannot answer, so the cost is unchanged.
+
+### Notes
+- **An overloaded provider is reported as a warning, never as an error, and
+  never points at Settings.** Nothing in the app's configuration causes it and
+  nothing in Settings fixes it, so the console says the provider is busy and that
+  retrying shortly normally works. Definite misconfigurations — the model is
+  absent from the catalogue, or the key was rejected — still read as errors and
+  still name the model, key and endpoint in ⚙️ Settings.
+- Verification still costs at most one token per launch. The conclusive negative
+  (the model is not in a catalogue that was read successfully) still spends
+  nothing at all.
+
 ## v0.6 — The selected model is validated at launch
 
 ### Added

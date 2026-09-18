@@ -98,6 +98,17 @@ def _gemini_catalogue(*names):
     )
 
 
+def _openai_completion(content="OK", status=200):
+    """A successful one-token completion — the confirmation rung."""
+    return FakeResponse(
+        status,
+        {
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8},
+        },
+    )
+
+
 OPENAI_BASE = "https://gateway.internal/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -105,36 +116,58 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # ---------------------------------------------------------------------------
 # Bullet 1 — the catalogue rung: free, and it actually answers the question
 # ---------------------------------------------------------------------------
-def test_a_model_in_the_catalogue_is_ready():
-    fake = FakeClient(get=_openai_catalogue("good-model", "other-model"))
+def test_a_model_in_the_catalogue_is_confirmed_by_the_capped_probe():
+    """A catalogue hit proves the model EXISTS; only a completion proves the
+    endpoint will SERVE it.
+
+    This was a real reported failure: the app announced a listed model READY and
+    the user's first request came back 503 UNAVAILABLE. Confirming costs the same
+    single token as a fallback probe, so it is affordable on every launch.
+    """
+    fake = FakeClient(
+        get=_openai_catalogue("good-model", "other-model"),
+        post=_openai_completion(),
+    )
     result = model_check.validate_model(
         base_url=OPENAI_BASE, api_key="k", model_name="good-model",
         client_factory=lambda **kw: fake,
     )
     assert result.ok is True
     assert result.status == model_check.READY
+    assert len(fake.post_calls) == 1, "a catalogue hit must still be confirmed"
 
 
-def test_a_catalogue_hit_costs_no_completion_call():
-    """The whole point of the cheap rung: zero tokens spent.
-
-    A probe is not merely more expensive, it is a different *kind* of call. If
-    any POST happens here the check has stopped being free on every launch.
-    """
-    fake = FakeClient(get=_openai_catalogue("good-model"))
+def test_the_catalogue_hit_confirmation_costs_exactly_one_output_token():
+    """The budget claim: whatever the path, verification costs at most one token."""
+    fake = FakeClient(
+        get=_openai_catalogue("good-model"), post=_openai_completion()
+    )
     result = model_check.validate_model(
         base_url=OPENAI_BASE, api_key="k", model_name="good-model",
         client_factory=lambda **kw: fake,
     )
-    assert fake.post_calls == [], (
-        "a catalogue hit must not spend a single token on a completion request"
+    assert fake.post_calls[0][1]["json"]["max_tokens"] == 1
+    assert result.tokens_used <= 1
+
+
+def test_a_model_absent_from_the_catalogue_spends_nothing():
+    """The conclusive negative must not probe: asking again cannot reach a model
+    the provider does not advertise, so the check stops at the catalogue."""
+    fake = FakeClient(get=_openai_catalogue("good-model", "other-model"))
+    result = model_check.validate_model(
+        base_url=OPENAI_BASE, api_key="k", model_name="absent-model",
+        client_factory=lambda **kw: fake,
     )
+    assert result.status == model_check.MISSING
+    assert fake.post_calls == [], "an absent model must not cost a completion"
     assert result.tokens_used == 0
 
 
 def test_the_catalogue_is_listed_exactly_once():
     """One metadata call, not one per rung — the check runs on every launch."""
-    fake = FakeClient(get=_openai_catalogue("good-model"))
+    fake = FakeClient(
+        get=_openai_catalogue("good-model"), post=_openai_completion()
+    )
     model_check.validate_model(
         base_url=OPENAI_BASE, api_key="k", model_name="good-model",
         client_factory=lambda **kw: fake,
@@ -153,28 +186,18 @@ def test_both_provider_dialects_read_their_own_catalogue_shape(base_url, respons
     """Gemini nests models under `models[]` with a `generateContent` filter;
     OpenAI-compatible gateways use `data[].id`. Reading the wrong shape would
     make every model look absent."""
-    fake = FakeClient(get=response)
+    fake = FakeClient(get=response, post=_openai_completion())
     result = model_check.validate_model(
         base_url=base_url, api_key="k", model_name="good-model",
         client_factory=lambda **kw: fake,
     )
     assert result.ok is True, result.message
-    assert result.tokens_used == 0
+    assert result.tokens_used <= 1
 
 
 # ---------------------------------------------------------------------------
-# Bullet 2 — the probe rung: only when the catalogue cannot answer, and capped
+# Bullet 2 — the probe rung: confirmation, capped at a single token
 # ---------------------------------------------------------------------------
-def _openai_completion(content="OK", status=200):
-    return FakeResponse(
-        status,
-        {
-            "choices": [{"message": {"role": "assistant", "content": content}}],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8},
-        },
-    )
-
-
 def test_a_model_absent_from_a_readable_catalogue_is_reported_missing():
     """The catalogue answered, and the answer was no. No probe is warranted:
     a model the provider does not list cannot be reached by asking again."""
