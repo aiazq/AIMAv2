@@ -4,6 +4,35 @@ Versioning rule: a **minor** bump (`v0.1` → `v0.2`) is a feature release;
 a **patch** bump (`v0.2` → `v0.2.1`) is a fix. The `APP_VERSION` constant in
 `app.py` and the git tag must always match — they are bumped in the same commit.
 
+## v0.6 — The selected model is validated at launch
+
+### Added
+- **The app now verifies the selected model can be reached before you do any
+  work.** Previously a wrong model name, a bad API key or a mistyped endpoint
+  only surfaced after uploading a recording and waiting for a dispatch to fail.
+  The check runs as the app starts and reports into the **Execution Console**.
+  On failure it names the model that could not be used and points you at
+  **⚙️ Settings**, where all three things it depends on — the model, the API key
+  and the provider endpoint — can be changed.
+
+### Notes
+- **Verification costs nothing when your setup is correct.** The check reads the
+  provider's own model catalogue first (a metadata call, no tokens). Only if that
+  catalogue cannot be read does it escalate to a single completion capped at one
+  output token. A working model therefore costs zero tokens to confirm, and a
+  broken one costs one.
+- **An uncertain answer is a warning, never an error.** If the endpoint is merely
+  slow or unreachable — a proxy that hides `/models`, a network hiccup — the
+  console says so without implying your configuration is wrong. Only a definite
+  answer (the model is absent from the catalogue, or the provider rejected the
+  key) is presented as something to fix.
+- **The check never blocks a run.** It reports and gets out of the way.
+- It re-validates exactly when the model, key or endpoint changes, so a fix is
+  confirmed rather than left stale. The stored fingerprint is a SHA-256 digest of
+  those settings — the API key itself is never copied into session state.
+- Set `AIMA_SKIP_MODEL_CHECK=1` to disable the check (the test suite uses this so
+  unit tests never touch the network).
+
 ## v0.5.2 — Transcript offsets past the hour are no longer misread
 
 ### Fixed

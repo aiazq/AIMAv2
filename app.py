@@ -2,6 +2,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -17,6 +18,7 @@ from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import media_pipeline
+import model_check
 import timeline
 
 # -----------------------------------------------------------------------------
@@ -177,7 +179,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # Single source of truth for the release shown at the foot of the page. Bump this
 # and the git tag together — a badge that disagrees with the tag tells the user
 # they are running code they are not.
-APP_VERSION = "v0.5.2"
+APP_VERSION = "v0.6"
 
 SECRET_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", st.secrets.get("GEMINI_API_KEY", "")))
 SECRET_BASE_URL = st.secrets.get("ENDPOINT_URL", os.environ.get("ENDPOINT_URL", DEFAULT_BASE_URL))
@@ -524,7 +526,14 @@ class DocumentAnalysisPlan(BaseModel):
 # -----------------------------------------------------------------------------
 # Logger
 # -----------------------------------------------------------------------------
-def log_event(log_container, logs_list, message: str, level: str = "INFO"):
+def append_log(logs_list, message: str, level: str = "INFO") -> str:
+    """Build one console entry and append it to `logs_list`. Returns the entry.
+
+    Split out of `log_event` because the container write below cannot happen
+    before the console column exists. The launch-time model check runs at module
+    scope, long before `main()` renders anything, so it needs to be able to
+    record a line in the log LIST without a container to write into.
+    """
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     level_css = {
         "INFO": "log-info",
@@ -541,9 +550,87 @@ def log_event(log_container, logs_list, message: str, level: str = "INFO"):
         entry = f'<span>[{ts}] <span class="{level_css}">[{level}]</span> {message}</span>'
 
     logs_list.append(entry)
+    return entry
+
+
+def render_log(log_container, logs_list) -> None:
+    """Repaint the console from `logs_list`. Newest entry first.
+
+    A `None` container is a no-op rather than an error: the launch-time check
+    calls `log_event` before `main()` has created the console column, and the
+    lines it recorded are already in the list by then — `main()` renders them
+    with the rest on its first pass.
+    """
+    if log_container is None:
+        return
     reversed_items = "<br>".join(reversed(logs_list))
     html_output = f'<div id="aima-terminal-box" class="terminal-container">{reversed_items}</div>'
     log_container.markdown(html_output, unsafe_allow_html=True)
+
+
+def log_event(log_container, logs_list, message: str, level: str = "INFO") -> str:
+    """`append_log` + repaint, for call sites that have a container."""
+    entry = append_log(logs_list, message, level)
+    render_log(log_container, logs_list)
+    return entry
+
+
+# -----------------------------------------------------------------------------
+# Launch-time model readiness
+# -----------------------------------------------------------------------------
+def settings_fingerprint(base_url: str, api_key: str, model_name: str) -> str:
+    """Digest of the three settings the readiness check depends on.
+
+    The digest is what the check stores to decide whether anything changed since
+    the last validation. Hashing rather than storing the values is deliberate: a
+    raw API key in `st.session_state` would sit alongside the generated report
+    and the JSON export tab, giving the credential a second way to escape. A
+    digest answers "did the settings change?" without keeping the secret.
+    """
+    material = "\x00".join([base_url or "", api_key or "", model_name or ""])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def run_model_readiness_check(logs_list) -> "model_check.ModelCheckResult | None":
+    """Validate the selected model on launch, recording the verdict in the console.
+
+    Cost: the provider's model catalogue is a metadata call (`GET /models`), which
+    is free. Only when that catalogue cannot be read does the check escalate to a
+    single completion capped at one output token. A ready model therefore costs
+    nothing, and a broken one costs one token.
+
+    Returns None (and logs nothing) when there is no model selected yet, so an
+    unconfigured app is not greeted with an error it cannot act on.
+
+    Idempotent by fingerprint: Streamlit re-executes this module on every
+    interaction, and a check that re-ran a network call on every click would be
+    both slow and, on the probe rung, a recurring cost. Re-validation happens
+    exactly when the model / key / endpoint changes.
+    """
+    api_key = st.session_state.get("api_key", "")
+    base_url = st.session_state.get("base_url", DEFAULT_BASE_URL)
+    model_name = st.session_state.get("selected_model", "")
+
+    if not model_name:
+        return None
+
+    fingerprint = settings_fingerprint(base_url, api_key, model_name)
+    if st.session_state.get("model_check_fingerprint") == fingerprint:
+        return None
+    st.session_state["model_check_fingerprint"] = fingerprint
+
+    result = model_check.validate_model(base_url, api_key, model_name)
+
+    append_log(logs_list, result.console_line(), result.log_level)
+    if result.severity == "error":
+        append_log(
+            logs_list,
+            "A run started anyway will report the provider's own error in this "
+            "console after dispatch.",
+            "DEBUG",
+        )
+    return result
+
 
 
 # -----------------------------------------------------------------------------
@@ -2151,6 +2238,26 @@ def format_report_time(value: datetime.time) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Launch-time validation that the selected model is ready to use.
+#
+# Runs at MODULE scope rather than inside `main()` so the verdict is already in
+# `logs_list` on the very first paint of the Execution Console — a failure the
+# user only learns about after clicking something is one they will not see.
+#
+# COST: the provider's model catalogue (`GET /models`) is a metadata call and
+# costs no tokens. Only when that catalogue cannot be read does the check spend a
+# single token on a one-token completion. Verifying a working model costs nothing.
+#
+# `AIMA_SKIP_MODEL_CHECK=1` disables it, which the test suite sets so unit tests
+# never make real network calls. The end-to-end launch test unsets it and points
+# the app at a local stub provider instead.
+# -----------------------------------------------------------------------------
+LAUNCH_MODEL_CHECK = None
+if os.environ.get("AIMA_SKIP_MODEL_CHECK") != "1":
+    LAUNCH_MODEL_CHECK = run_model_readiness_check(st.session_state["logs_list"])
+
+
+# -----------------------------------------------------------------------------
 # Main Application UI
 # -----------------------------------------------------------------------------
 def main():
@@ -2178,6 +2285,10 @@ def main():
                 "logs_list",
                 "audio_registry",
                 "audio_order",
+                # Start Over resets the session, including what the launch check
+                # already proved — so it revalidates rather than trusting a
+                # verdict that belonged to a previous configuration.
+                "model_check_fingerprint",
             ]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -2189,7 +2300,14 @@ def main():
         with st.popover("⚙️ Settings", use_container_width=True):
             st.markdown("**Provider & Model Settings**")
             has_key = bool(st.session_state.get("api_key"))
-            st.caption(f"Status: {'🟢 Key is Set' if has_key else '🔴 No Key Set'}")
+            _check = LAUNCH_MODEL_CHECK
+            if _check is not None and _check.severity == "error":
+                # The launch check already proved this combination cannot work.
+                # Showing a green "Key is Set" next to that failure is the kind of
+                # contradiction that sends the user looking in the wrong place.
+                st.caption(f"Status: 🔴 {_check.message}")
+            else:
+                st.caption(f"Status: {'🟢 Key is Set' if has_key else '🔴 No Key Set'}")
 
             new_key = st.text_input(
                 "API Key / Token:",
@@ -2199,6 +2317,10 @@ def main():
             )
             if new_key.strip():
                 st.session_state["api_key"] = new_key.strip()
+                # Drop the readiness fingerprint so the launch check re-validates
+                # the moment Settings changes. Without this the user would fix
+                # their key and still see the old failure in the console.
+                st.session_state.pop("model_check_fingerprint", None)
                 st.rerun()
 
             current_base = st.session_state.get("base_url", DEFAULT_BASE_URL)
@@ -2208,6 +2330,7 @@ def main():
                 st.session_state["available_models"] = fetch_available_models(
                     st.session_state["base_url"], st.session_state.get("api_key", "")
                 )
+                st.session_state.pop("model_check_fingerprint", None)
                 st.rerun()
 
             st.markdown("---")
@@ -2215,11 +2338,15 @@ def main():
             curr_model = st.session_state.get("selected_model", DEFAULT_MODEL)
             idx = models_list.index(curr_model) if curr_model in models_list else 0
 
-            st.session_state["selected_model"] = st.selectbox(
+            chosen_model = st.selectbox(
                 "Active AI Model:",
                 options=models_list,
                 index=idx,
             )
+            if chosen_model != curr_model:
+                # The user changed the model — re-validate it on the next pass.
+                st.session_state.pop("model_check_fingerprint", None)
+            st.session_state["selected_model"] = chosen_model
 
             if st.button("🔄 Refresh Models List", use_container_width=True):
                 st.session_state["available_models"] = fetch_available_models(
